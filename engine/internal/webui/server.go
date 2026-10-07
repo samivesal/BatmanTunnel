@@ -1,0 +1,985 @@
+package webui
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	_ "embed"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/backpack/backpack/internal/app"
+	"github.com/backpack/backpack/internal/control"
+	"github.com/backpack/backpack/internal/manage"
+	"github.com/backpack/backpack/internal/node"
+	"github.com/backpack/backpack/internal/utils/network"
+)
+
+//go:embed assets/login.html
+var loginHTML []byte
+
+//go:embed assets/twofactor.html
+var twoFactorHTML []byte
+
+const sessionCookie = "backpack_session"
+
+// sessionTTL is how long a signed-in browser stays signed in. It was written
+// out as `12 * time.Hour` in the store and as `12 * 3600` in the cookie; one
+// name means the cookie and the session it names cannot expire at different
+// times.
+const sessionTTL = 12 * time.Hour
+
+// sessionInfo is what the panel remembers about one signed-in browser — the
+// address and age make the Settings session list meaningful, and the token
+// itself is never shown again.
+type sessionInfo struct {
+	expires time.Time
+	created time.Time
+	ip      string
+}
+
+type sessionStore struct {
+	mu       sync.Mutex
+	sessions map[string]*sessionInfo
+}
+
+func newSessionStore() *sessionStore {
+	return &sessionStore{sessions: map[string]*sessionInfo{}}
+}
+
+func (s *sessionStore) create(ip string) string {
+	tok := randomHex(24)
+	s.mu.Lock()
+	// Purge expired sessions so the map can't grow without bound over time.
+	now := time.Now()
+	for t, si := range s.sessions {
+		if now.After(si.expires) {
+			delete(s.sessions, t)
+		}
+	}
+	s.sessions[tok] = &sessionInfo{expires: now.Add(sessionTTL), created: now, ip: ip}
+	s.mu.Unlock()
+	return tok
+}
+
+func (s *sessionStore) valid(tok string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	si, ok := s.sessions[tok]
+	if !ok {
+		return false
+	}
+	if time.Now().After(si.expires) {
+		delete(s.sessions, tok)
+		return false
+	}
+	return true
+}
+
+// sessionID is the public name of a session: a hash prefix, so the list can
+// identify one without ever handing out something that logs somebody in.
+func sessionID(tok string) string {
+	sum := sha256.Sum256([]byte(tok))
+	return hex.EncodeToString(sum[:6])
+}
+
+// SessionEntry is one row of the Settings session list.
+type SessionEntry struct {
+	ID      string `json:"id"`
+	IP      string `json:"ip"`
+	Created string `json:"created"`
+	Current bool   `json:"current"`
+}
+
+// list returns every live session, newest first, marking the caller's own.
+func (s *sessionStore) list(currentTok string) []SessionEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	var out []SessionEntry
+	for tok, si := range s.sessions {
+		if now.After(si.expires) {
+			continue
+		}
+		out = append(out, SessionEntry{
+			ID:      sessionID(tok),
+			IP:      si.ip,
+			Created: si.created.Format("2006-01-02 15:04"),
+			Current: tok == currentTok,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Created > out[j].Created })
+	return out
+}
+
+// revokeID ends the session with the given public id. Revoking your own works
+// too — it is just signing out the long way around.
+func (s *sessionStore) revokeID(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for tok := range s.sessions {
+		if sessionID(tok) == id {
+			delete(s.sessions, tok)
+			return
+		}
+	}
+}
+
+// revokeOthers ends every session except the caller's.
+func (s *sessionStore) revokeOthers(currentTok string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for tok := range s.sessions {
+		if tok != currentTok {
+			delete(s.sessions, tok)
+		}
+	}
+}
+
+func (s *sessionStore) destroy(tok string) {
+	s.mu.Lock()
+	delete(s.sessions, tok)
+	s.mu.Unlock()
+}
+
+// clear invalidates every session (used after a password change).
+func (s *sessionStore) clear() {
+	s.mu.Lock()
+	s.sessions = map[string]*sessionInfo{}
+	s.mu.Unlock()
+}
+
+type server struct {
+	sessions *sessionStore
+
+	// pending holds logins that have passed the password and not yet the
+	// second factor. See totpauth.go for why it is a store of its own rather
+	// than a flag on a session.
+	pending *pendingStore
+
+	// enrolling is the secret being set up right now, held in memory until a
+	// code proves the authenticator app has it.
+	//
+	// Not written to the file, on purpose: a secret on disk that is not in
+	// force yet is a panel in a state nothing else understands, and an operator
+	// who closes the tab half way through should find the second factor off
+	// rather than half on. A panel restart loses it, which is the same thing.
+	enrolMu   sync.Mutex
+	enrolling string
+
+	// The things this panel operates on, which it reads rather than owns. They
+	// used to be package-level variables sitting beside the handlers; see
+	// internal/control for why they are not any more.
+	//
+	// They are always present and empty rather than nil, so every handler can
+	// ask a question without first checking whether the feature exists.
+	nodes *control.Fleet
+	net   *control.Net
+	jobs  *control.Jobs
+	// want is what the fleet is supposed to be running, so that a node which
+	// has drifted from it can be noticed rather than discovered. See
+	// internal/control/desired.go.
+	want *control.Desired
+
+	// The tools of the Connection Test and Manage sections, each of which runs
+	// one thing at a time in the background. Values rather than pointers so a
+	// server built as a literal in a test has them too. See handlers_conntest.go
+	// and handlers_manage.go.
+	conntest conntestRunner
+	// terminals counts the open root shells; see terminal.go.
+	terminals terminalCount
+
+	// ctx is the panel's own lifetime, which is what a background job is tied
+	// to. A job tied to the request that started it would be cancelled the
+	// moment the browser had its reply, and a fleet rollout answers in
+	// milliseconds and runs for minutes.
+	ctx context.Context
+}
+
+// basePrefix is the path the panel is served under, read from disk for the same
+// reason password() is: it is what the pages have to be stamped with, and a
+// copy captured at startup would be wrong for exactly one request after a
+// change — the one that made it.
+func basePrefix() string { return Load().PathPrefix() }
+
+// password always reads the current password from disk, so a change made from
+// the CLI or the web UI takes effect immediately — no restart, no stale cache.
+func (s *server) password() string {
+	return Load().Password
+}
+
+// updatePassword persists a new password (read fresh on the next login).
+func (s *server) updatePassword(pw string) error {
+	c := Load()
+	c.Password = pw
+	return Save(c)
+}
+
+// Serve starts the web panel and blocks. Invoked by `backpack --webui`.
+func Serve() error {
+	cfg, err := EnsurePassword()
+	if err != nil {
+		return err
+	}
+	srv := newServer()
+
+	// The SOCKS5 relay, the watchdog, the Telegram bot and the alerts all
+	// deliberately run elsewhere — in the backpack-monitor service. See
+	// internal/monitor for why.
+
+	// The panel shows live stats, tunnel state and logs, and — through the
+	// /api/tunnel/* endpoints below — creates, edits and drives tunnels the same
+	// way the CLI menu does. Every endpoint is behind a session or a scoped
+	// token; which scope each one needs is in routes().
+	mux := srv.routes()
+
+	// Ready to reach the fleet. Nothing is contacted here and nothing can
+	// fail: the panel dials out when it has something to ask, so a server that
+	// is down costs the operation that wanted it and nothing else.
+	//
+	// There is no switch for this any more. It guarded a listener that had to
+	// be opened before a server could connect; the panel dials out now, so with
+	// no servers in the fleet it does nothing at all, and turning "nothing at
+	// all" off was a setting that could only ever be in the way.
+	_ = srv.nodes.Start()
+	// Loss and round trip to every managed server, measured in the background
+	// so no request ever waits on a ping. See internal/control/net.go.
+	//
+	// Tied to this call rather than to the process: when Serve returns — which
+	// it only does on an error it cannot recover from — the probing stops with
+	// it instead of going on dialling a fleet nothing is left to show.
+	probeCtx, stopProbing := context.WithCancel(context.Background())
+	defer stopProbing()
+	srv.net.Start(probeCtx)
+	// The cards' rate history, kept whether or not a browser is polling. See
+	// runRateSampler.
+	go runRateSampler(probeCtx.Done())
+	// Asked once now, so the first Settings or Maintenance opened does not
+	// wait on GitHub. See updateAnswer.
+	go updateAnswer.get()
+	// Background jobs share that lifetime. A rollout left running against a
+	// fleet after the panel has gone is exactly the thing nobody would notice
+	// until it had finished.
+	srv.ctx = probeCtx
+
+	// Said once, at startup, into the journal.
+	//
+	// The panel answers under an unguessable path and nowhere else, so an
+	// operator whose bookmark stopped working after an upgrade needs somewhere
+	// to read the new one. The CLI's Web Panel screen shows it; this is the
+	// other place, for anyone who reaches for the log first.
+	if p := cfg.PathPrefix(); p != "" {
+		log.Printf("panel listening on :%d under %s/ — it answers nowhere else", cfg.Port, p)
+	} else {
+		log.Printf("panel listening on :%d at the root", cfg.Port)
+	}
+
+	addr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
+	httpServer := &http.Server{
+		Addr: addr,
+		// The base path is outermost: a request that is not under it is a 404
+		// before anything else looks at it.
+		Handler:      withBasePath(cfg.PathPrefix(), withPanelSecurity(mux)),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+	}
+	panelServerLimits(httpServer)
+	if !cfg.HTTPS {
+		return httpServer.ListenAndServe()
+	}
+
+	// A certificate for the panel itself. The self-signed pair is generated
+	// against whatever the panel answers on — a bare IP is normal here, and no
+	// certificate authority will sign one of those, so it is the only option
+	// without a domain. With a domain, Let's Encrypt issues a real one and
+	// renews it on its own; the config is resolved per handshake, so a renewal
+	// lands without restarting the panel.
+	settings := network.TLSSettings{
+		ACMEDomain:   cfg.TLSDomain,
+		ACMEEmail:    cfg.TLSEmail,
+		ACMECacheDir: app.ConfigDir + "/acme",
+	}
+	// The self-signed pair is prepared on both paths. On the Let's Encrypt path
+	// it is never served while issuance is working; it is what keeps the panel
+	// answering when it is not, which is the difference between "the browser
+	// warns" and "the operator cannot reach the page that would fix it".
+	if certFile, keyFile, err := manage.EnsurePanelCert(cfg.TLSSelfHost); err == nil {
+		settings.FallbackCertFile, settings.FallbackKeyFile = certFile, keyFile
+	} else if settings.ACMEDomain != "" {
+		log.Printf("no fallback certificate (%v) — if Let's Encrypt cannot issue, "+
+			"this panel will refuse every connection", err)
+	}
+	ownCert := false
+	if cfg.OwnCert() {
+		// The operator's own certificate, served as it is. See OwnCert.
+		//
+		// Checked before it is committed to: a certificate that cannot be
+		// read — moved, deleted, a renewal half written — would otherwise stop
+		// the panel from starting at all, and the panel is where it would be
+		// fixed. So the self-signed pair is served instead, and the reason is
+		// said.
+		own := network.TLSSettings{CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile}
+		if _, err := network.HTTPSConfig(own, nil); err != nil {
+			log.Printf("the panel's own certificate (%s, %s) cannot be used: %v — serving the "+
+				"self-signed certificate instead so the panel stays reachable",
+				cfg.TLSCertFile, cfg.TLSKeyFile, err)
+			settings.ACMEDomain = ""
+		} else {
+			settings, ownCert = own, true
+		}
+	}
+	if !ownCert && settings.ACMEDomain == "" {
+		// EnsurePanelCert builds the SAN set from the machine's own interfaces
+		// (plus loopback, the public IP when reachable, and an optional operator
+		// host), so the certificate validates on whatever address the panel is
+		// reached on — not a single guess that is "-" on a filtered network.
+		certFile, keyFile, err := manage.EnsurePanelCert(cfg.TLSSelfHost)
+		if err != nil {
+			return fmt.Errorf("web panel certificate: %w", err)
+		}
+		settings.CertFile, settings.KeyFile = certFile, keyFile
+	}
+	tlsCfg, err := network.HTTPSConfig(settings, func(format string, a ...any) {
+		log.Printf(format, a...)
+	})
+	if err != nil {
+		return fmt.Errorf("web panel TLS: %w", err)
+	}
+	httpServer.TLSConfig = tlsCfg
+	return httpServer.ListenAndServeTLS("", "")
+}
+
+// routes is every endpoint the panel answers and the scope each one needs.
+//
+// It is a function of its own so the whole table can be tested as it is
+// actually wired: the guard was tested on its own and the table was not, which
+// is how the endpoints that hand out access came to sit at the same scope as
+// the ones that restart a tunnel.
+func (s *server) routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/login", s.handleLogin)
+	mux.HandleFunc("/api/totp", s.requireAdmin(s.handleTOTP))
+	mux.HandleFunc("/logout", s.handleLogout)
+	// The panel, and everything it loads. Registered at "/", so it is also
+	// the catch-all for anything no other route claims. See panel.go.
+	mux.HandleFunc("/", s.requireAuth(s.handlePanel))
+	// Where the panel answered while there were two of them.
+	mux.HandleFunc(panelPrefix, s.requireAuth(s.handleOldPanelPath))
+	// The read-scoped endpoints, so a Prometheus scraper or a status page can
+	// watch with a read token and no browser session.
+	mux.HandleFunc("/api/stats", s.requireReadAuth(s.handleStats))
+	mux.HandleFunc("/api/tunnels", s.requireReadAuth(s.handleTunnels))
+	mux.HandleFunc("/metrics", s.requireReadAuth(s.handlePrometheus))
+	mux.HandleFunc("/api/logs", s.requireAuth(s.handleLogs))
+	// Tunnel management — the CLI's setup wizard, edit screen and service
+	// actions, reachable from the browser.
+	mux.HandleFunc("/api/tunnel/options", s.requireAuth(s.handleTunnelOptions))
+	mux.HandleFunc("/api/tunnel/suggest", s.requireAuth(s.handleTunnelSuggest))
+	mux.HandleFunc("/api/tunnel/defaults", s.requireAuth(s.handleTunnelDefaults))
+	mux.HandleFunc("/api/tunnel/create", s.requireAuth(s.handleTunnelCreate))
+	// The direct half, on its own endpoints so the reverse ones are untouched.
+	mux.HandleFunc("/api/direct/options", s.requireAuth(s.handleDirectOptions))
+	mux.HandleFunc("/api/direct/defaults", s.requireAuth(s.handleDirectDefaults))
+	mux.HandleFunc("/api/direct/create", s.requireAuth(s.handleDirectCreate))
+	mux.HandleFunc("/api/tunnel/settings", s.requireAuth(s.handleTunnelSettings))
+	// Handing a tunnel's paired settings to the other server, and taking them
+	// from it. See handleShareLink.
+	// Managed servers: the fleet, the login each one is reached with, and
+	// building both ends of a tunnel in a single submission. See
+	// handlers_nodes.go.
+	mux.HandleFunc("/api/nodes", s.requireAuth(s.handleNodes))
+	mux.HandleFunc("/api/fleet/drift", s.requireReadAuth(s.handleDrift))
+	mux.HandleFunc("/api/node/pair", s.requireAuth(s.handleNodePair))
+	// Linking a tunnel that already exists to the server holding its other
+	// end. See handlers_adopt.go.
+	mux.HandleFunc("/api/tunnel/adopt", s.requireAuth(s.handleTunnelAdopt))
+	mux.HandleFunc("/api/tunnel/edit", s.requireAuth(s.handleTunnelEdit))
+	mux.HandleFunc("/api/tunnel/action", s.requireAuth(s.handleTunnelAction))
+	mux.HandleFunc("/api/password", s.requireAdmin(s.handlePassword))
+	mux.HandleFunc("/api/update", s.requireAuth(s.handleUpdate))
+	mux.HandleFunc("/api/update/status", s.requireAuth(s.handleUpdateStatus))
+	mux.HandleFunc("/api/panelport", s.requireAdmin(s.handlePanelPort))
+	mux.HandleFunc("/api/panelcert", s.requireAdmin(s.handlePanelCert))
+	mux.HandleFunc("/api/backup/export", s.requireAdmin(s.handleBackupExport))
+	mux.HandleFunc("/api/backup/import", s.requireAdmin(s.handleBackupImport))
+	mux.HandleFunc("/api/telegram", s.requireAdmin(s.handleTelegram))
+	mux.HandleFunc("/api/telegram/test", s.requireAuth(s.handleTelegramTest))
+	mux.HandleFunc("/api/relays", s.requireAuth(s.handleRelayOptions))
+	mux.HandleFunc("/api/health", s.requireAuth(s.handleHealth))
+	mux.HandleFunc("/api/alerts", s.requireReadAuth(s.handleAlerts))
+	mux.HandleFunc("/api/linktest", s.requireAuth(s.handleLinkTest))
+	mux.HandleFunc("/api/confhist", s.requireAuth(s.handleConfHistory))
+	mux.HandleFunc("/api/confhist/restore", s.requireAuth(s.handleConfRestore))
+	mux.HandleFunc("/api/restorepoints", s.requireAuth(s.handleRestorePoints))
+	// Setup links, backups on the server, installing from a file, rollback and
+	// the panel's own path, code and restart. See handlers_upkeep.go.
+	mux.HandleFunc("/api/tunnel/link", s.requireAuth(s.handleTunnelLink))
+	mux.HandleFunc("/api/tunnel/quota", s.requireAuth(s.handleTunnelQuota))
+	mux.HandleFunc("/api/backups", s.requireAdmin(s.handleBackups))
+	mux.HandleFunc("/api/backups/file", s.requireAdmin(s.handleBackupFile))
+	mux.HandleFunc("/api/update/local", s.requireAdmin(s.handleLocalUpdate))
+	mux.HandleFunc("/api/update/rollback", s.requireAdmin(s.handleRollback))
+	mux.HandleFunc("/api/panel", s.requireAdmin(s.handlePanelSelf))
+	// The Connection Test and Manage sections: the menu's tools, from the
+	// browser. See handlers_conntest.go and handlers_manage.go.
+	mux.HandleFunc("/api/conntest", s.requireAuth(s.handleConnTest))
+	mux.HandleFunc("/api/manage", s.requireAuth(s.handleManage))
+	mux.HandleFunc("/api/manage/refresh", s.requireAuth(s.handleAutoRefresh))
+	mux.HandleFunc("/api/manage/proxy", s.requireAdmin(s.handleProxy))
+	// A root shell on this machine. Admin, and a browser session only — never a
+	// token, whatever its scope. See terminal.go.
+	mux.HandleFunc("/api/terminal", s.requireAdmin(s.handleTerminal))
+	// Access control. Issuing a credential is guarded harder than using one:
+	// a write token must not be able to mint itself a better one. See access.go.
+	mux.HandleFunc("/api/tokens", s.guard(ScopeAdmin, s.handleTokens))
+	mux.HandleFunc("/api/audit", s.guard(ScopeAdmin, s.handleAudit))
+	mux.HandleFunc("/api/sessions", s.requireAdmin(s.handleSessions))
+	mux.HandleFunc("/api/autobackup", s.requireAuth(s.handleAutoBackup))
+	mux.HandleFunc("/api/history", s.requireAuth(s.handleHistory))
+	mux.HandleFunc("/api/channel", s.requireAuth(s.handleChannel))
+	// The manifest, icons and service worker are what let the panel install as
+	// an app; the browser fetches them before any login, so they carry no data
+	// and no auth. The worker is required for an install offer and must be
+	// served from the root to control the whole origin.
+	mux.HandleFunc("/manifest.json", handleManifest)
+	mux.HandleFunc("/icon.svg", handleIcon)
+	mux.HandleFunc("/icons/", handleIconPNG)
+	mux.HandleFunc("/sw.js", handleServiceWorker)
+	return mux
+}
+
+// requireAuth wraps a handler, redirecting unauthenticated users to /login
+// (or 401 for API calls).
+func (s *server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return s.guard(ScopeWrite, next)
+}
+
+// requireReadAuth guards the endpoints that only read.
+//
+// It used to accept a second credential as well — a read-only token, for a
+// scraper or a peer panel. Nothing used it: it had to be minted by hand from a
+// screen most operators never opened, so nothing issued it, and a credential
+// nobody issues is a credential nobody rotates. Removing it was right and it
+// left /metrics — an endpoint built for scrapers — behind a session cookie,
+// which no scraper has.
+//
+// Tokens are back, and the reasons they were removed are addressed rather than
+// repeated: they are scoped like everything else, they are listed where an
+// operator sees them, they carry a required expiry, and they record when they
+// were last used so a dead one can be recognised. See access.go.
+func (s *server) requireReadAuth(next http.HandlerFunc) http.HandlerFunc {
+	return s.guard(ScopeRead, next)
+}
+
+// requireAdmin guards the endpoints that decide who can get in: the password,
+// the second factor, the signed-in devices, the Telegram admins, the panel's
+// own address and certificate, and the backup — which carries the password out
+// in one direction and can replace every credential file in the other.
+//
+// Any one of them turns a write token into the panel password, and the panel
+// password is admin. Guarding /api/tokens at admin while these sat at write
+// was a door locked beside one standing open.
+func (s *server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return s.guard(ScopeAdmin, next)
+}
+
+// guard is the one place a request is authorised, and therefore the one place
+// an action is recorded.
+//
+// Splitting those two jobs is the obvious design and it is the wrong one. An
+// audit log written by each handler has one hole per handler somebody forgot to
+// update, and the holes are invisible until the day somebody goes looking.
+// Written here, the only way to act without being recorded is to act without
+// being authorised.
+func (s *server) guard(need Scope, next http.HandlerFunc) http.HandlerFunc {
+	// Counted outside the authorisation, so a request refused for a bad
+	// credential is counted too — that is the one most worth knowing about.
+	// See selfmetrics.go.
+	return instrument(func(w http.ResponseWriter, r *http.Request) {
+		// A presented credential that is wrong is a guess, and guesses are
+		// rate-limited wherever they arrive.
+		//
+		// The login form has been limited since there was a login form. Tokens
+		// arrived later and got none of it, so /metrics — an endpoint that
+		// exists to be polled by something that is not a browser — would answer
+		// an unlimited number of guesses at line rate. The same limiter is used
+		// rather than a second one: two rate limiters is how they drift, and an
+		// attacker does not care which door they are trying.
+		if secret := bearer(r); secret != "" {
+			if blocked, left := limiter.blocked(clientIP(r)); blocked {
+				http.Error(w, fmt.Sprintf("too many failed attempts — try again in %d minutes",
+					int(left.Minutes())+1), http.StatusTooManyRequests)
+				return
+			}
+		}
+
+		who, ok := s.identify(r)
+		if !ok || who.Scope < need {
+			// A browser gets sent to the login page; anything else gets a
+			// status code, because a scraper following a redirect to an HTML
+			// login form reports success and scrapes the form.
+			isAPI := strings.HasPrefix(r.URL.Path, "/api") || r.URL.Path == "/metrics"
+			if isAPI || bearer(r) != "" {
+				if ok {
+					// It proved who it is and is not allowed to do this, which
+					// is a different answer and a more useful one.
+					s.note(r, who, http.StatusForbidden)
+					http.Error(w, fmt.Sprintf("this credential is %s and this needs %s", who.Scope, need),
+						http.StatusForbidden)
+					return
+				}
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			redirectTo(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		if !auditable(r) {
+			next(w, r)
+			return
+		}
+		rec := &statusRecorder{ResponseWriter: w}
+		next(rec, r)
+		s.note(r, who, rec.status)
+	})
+}
+
+// identify works out who is making a request: a panel session, or a scoped
+// token.
+//
+// A wrong token is counted against the address and a right one clears the
+// count, exactly as a wrong and a right password are. Clearing matters as much
+// as counting: a fleet behind one NAT address would otherwise have its working
+// scraper locked out by somebody else's typo.
+func (s *server) identify(r *http.Request) (caller, bool) {
+	ip := clientIP(r)
+	if c, err := r.Cookie(sessionCookie); err == nil && s.sessions.valid(c.Value) {
+		// The session is the panel password, which is full access. Named
+		// operators at lesser levels are a separate credential — a token —
+		// because a second password on the same login form would be a second
+		// thing to brute force against the same rate limiter.
+		return caller{Kind: "session", Name: sessionID(c.Value), Scope: ScopeAdmin, IP: ip}, true
+	}
+	if secret := bearer(r); secret != "" {
+		if tok, ok := checkToken(secret); ok {
+			limiter.reset(ip)
+			return caller{Kind: "token", Name: tok.Name, Scope: tok.Scope, IP: ip}, true
+		}
+		limiter.fail(ip)
+	}
+	return caller{IP: ip}, false
+}
+
+// note writes one line of the record.
+func (s *server) note(r *http.Request, who caller, status int) {
+	record(auditEntry{
+		At:     time.Now().Unix(),
+		Who:    who.describe(),
+		IP:     who.IP,
+		Method: r.Method,
+		Path:   r.URL.Path,
+		Action: auditAction(r),
+		Status: status,
+	})
+}
+
+func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		ip := clientIP(r)
+		// Every attempt is counted as it starts, and cleared only by a full
+		// sign-in. Checking first and counting after the answer let a burst
+		// of parallel requests all pass the check before any was counted.
+		if ok, left := limiter.attempt(ip); !ok {
+			http.Error(w, fmt.Sprintf("too many failed attempts — try again in %d minutes",
+				int(left.Minutes())+1), http.StatusTooManyRequests)
+			return
+		}
+		// Bounded before it is parsed: this runs before any authentication.
+		r.Body = http.MaxBytesReader(w, r.Body, maxLoginBody)
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "bad login request", http.StatusBadRequest)
+			return
+		}
+		// The second step of a two-factor login: the password was accepted a
+		// moment ago and this is the code for it. Checked first, because a
+		// request carrying a pending token is never a password attempt.
+		if c, err := r.Cookie(twoFactorCookie); err == nil && s.pending.attempt(c.Value, ip) {
+			if checkSecondFactor(r.FormValue("code")) {
+				s.pending.destroy(c.Value)
+				limiter.reset(ip)
+				http.SetCookie(w, clearedCookie(r, twoFactorCookie))
+				tok := s.sessions.create(ip)
+				http.SetCookie(w, authCookie(r, sessionCookie, tok, sessionTTL))
+				redirectTo(w, r, "/", http.StatusSeeOther)
+				return
+			}
+			// A wrong code has counted against the address, exactly as a wrong
+			// password does, and against the pending sign-in: it survives a
+			// few typos within its three minutes, and then the operator starts
+			// again from the password. Once it has ended, the code prompt is
+			// not shown again — a code typed into it could no longer succeed.
+			time.Sleep(1 * time.Second)
+			if s.pending.valid(c.Value, ip) {
+				s.serveSecondFactorPage(w, r, http.StatusUnauthorized)
+				return
+			}
+			http.SetCookie(w, clearedCookie(r, twoFactorCookie))
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write(withNonce(withBase(withLoginState(loginHTML, true), basePrefix()), r))
+			return
+		}
+
+		given := r.FormValue("password")
+		// Constant-time comparison + small delay to slow brute force.
+		if subtle.ConstantTimeCompare([]byte(given), []byte(s.password())) == 1 {
+			// The password alone is a session only where there is no second
+			// factor. Where there is one, it buys the code prompt and nothing
+			// else — see totpauth.go.
+			if twoFactorOn() {
+				// The failure count is NOT cleared here. The password alone
+				// is not a sign-in when a second factor follows; clearing the
+				// count on it let a caller who knew the password alternate
+				// password and wrong codes for ever and never reach the
+				// lockout. It is cleared when the code is right, below.
+				tok := s.pending.create(ip)
+				http.SetCookie(w, authCookie(r, twoFactorCookie, tok, twoFactorTTL))
+				s.serveSecondFactorPage(w, r, http.StatusOK)
+				return
+			}
+			limiter.reset(ip)
+			tok := s.sessions.create(ip)
+			http.SetCookie(w, authCookie(r, sessionCookie, tok, sessionTTL))
+			redirectTo(w, r, "/", http.StatusSeeOther)
+			return
+		}
+		time.Sleep(1 * time.Second)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write(withNonce(withBase(withLoginState(loginHTML, true), basePrefix()), r))
+		return
+	}
+
+	// A GET with a live pending token is somebody who reloaded the code page.
+	if c, err := r.Cookie(twoFactorCookie); err == nil && s.pending.valid(c.Value, clientIP(r)) {
+		s.serveSecondFactorPage(w, r, http.StatusOK)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(withNonce(withBase(withLoginState(loginHTML, false), basePrefix()), r))
+}
+
+// serveSecondFactorPage draws the code prompt.
+func (s *server) serveSecondFactorPage(w http.ResponseWriter, r *http.Request, status int) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	page := withLoginState(twoFactorHTML, status == http.StatusUnauthorized)
+	w.Write(withNonce(withBase(page, basePrefix()), r))
+}
+
+func (s *server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	// A sign-out somebody else's page navigated the browser into is not a
+	// sign-out the operator asked for. See crossSiteNavigation; the panel's own
+	// link is same-origin and unaffected.
+	if crossSiteNavigation(r) {
+		redirectTo(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		s.sessions.destroy(c.Value)
+	}
+	http.SetCookie(w, clearedCookie(r, sessionCookie))
+	redirectTo(w, r, "/login", http.StatusSeeOther)
+}
+
+func (s *server) handleStats(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, GatherSystem())
+}
+
+func (s *server) handleTunnels(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, gatherTunnels(s.nodes.Runner()))
+}
+
+func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "missing name", http.StatusBadRequest)
+		return
+	}
+
+	// ?end=peer asks for the other server's journal for the same tunnel.
+	//
+	// A tunnel is one thing in two places and its log is not. Half of what went
+	// wrong is on the far machine — a client that cannot dial, a certificate it
+	// could not read, a port already held there — and reading it meant logging
+	// into that machine, which is the second pass this whole feature exists to
+	// remove.
+	if r.URL.Query().Get("end") == "peer" {
+		s.writePeerLogs(w, name)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write([]byte(TunnelLogs(name)))
+}
+
+// writePeerLogs fetches the far end's journal, or says plainly why it cannot.
+//
+// Plain text either way, including the refusals: the screen puts this in a log
+// pane, and a JSON error there would be read as something the tunnel printed.
+func (s *server) writePeerLogs(w http.ResponseWriter, name string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+
+	pair, ok := manage.PairFor(name)
+	if !ok {
+		fmt.Fprintf(w, "%s was not built across a managed server, so there is no "+
+			"other end for this panel to read.\n", name)
+		return
+	}
+	run := s.nodes.Runner()
+	if run == nil {
+		fmt.Fprintf(w, "Managed servers are turned off, so %s cannot be reached.\n", pair.Node)
+		return
+	}
+	peer := pair.PeerName
+	if peer == "" {
+		peer = name
+	}
+	var res node.LogsResult
+	if err := run.Call(pair.Node, node.OpLogs, node.LogsRequest{Name: peer, Lines: 150}, &res); err != nil {
+		fmt.Fprintf(w, "Could not read %s's log on %s: %v\n", peer, pair.Node, err)
+		return
+	}
+	if strings.TrimSpace(res.Text) == "" {
+		fmt.Fprintf(w, "%s on %s has written nothing to its journal yet.\n", peer, pair.Node)
+		return
+	}
+	w.Write([]byte(res.Text))
+}
+
+// handlePassword lets a logged-in user set their own password. It updates the
+// running server in place (no restart) and invalidates all sessions so everyone
+// must log in again with the new password.
+func (s *server) handlePassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	pw, err := passwordFrom(w, r)
+	if err != nil {
+		http.Error(w, "could not read the request", http.StatusBadRequest)
+		return
+	}
+	if len(pw) < 4 || len(pw) > 128 {
+		http.Error(w, "password must be 4–128 characters", http.StatusBadRequest)
+		return
+	}
+	if err := s.updatePassword(pw); err != nil {
+		http.Error(w, "could not save password", http.StatusInternalServerError)
+		return
+	}
+	s.sessions.clear() // force re-login everywhere
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+// handleUpdate checks for (GET) or applies (POST) a GitHub update.
+// POST runs the update in the background — the panel restarts as part of it, so
+// the browser should show a "reconnecting" state and reload shortly after.
+func (s *server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, updateAnswer.get())
+	case http.MethodPost:
+		updateProgress.start()
+		go func() {
+			err := manage.ApplyUpdate(updateProgress.log)
+			updateProgress.finish(err)
+			// The panel's own unit restarts last, after the outcome is recorded
+			// (the restart ends this process).
+			manage.FinishDeferredRestarts()
+		}()
+		writeJSON(w, map[string]string{"status": "started"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// updateAnswer is the last "is there a newer release" answer, kept a while.
+//
+// Asking GitHub is the slow part of opening Settings or Maintenance — seconds
+// from a server in Iran — and both dialogs waited on it, drawing the preview's
+// sample versions until it came back. The answer changes a few times a year;
+// ten minutes old is as good as new. A failed check is kept for less, so a
+// blocked moment does not stick.
+var updateAnswer = &updateCache{}
+
+type updateCache struct {
+	mu   sync.Mutex
+	at   time.Time
+	resp map[string]any
+}
+
+func (c *updateCache) get() map[string]any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	keep := 10 * time.Minute
+	if c.resp != nil && c.resp["error"] == true {
+		keep = 30 * time.Second
+	}
+	if c.resp != nil && time.Since(c.at) < keep {
+		return c.resp
+	}
+	available, summary, err := manage.CheckUpdate()
+	if err != nil {
+		c.resp = map[string]any{"available": false, "summary": err.Error(), "error": true}
+	} else {
+		c.resp = map[string]any{"available": available, "summary": summary}
+	}
+	c.at = time.Now()
+	return c.resp
+}
+
+// updateProgress records what the last update attempt did.
+//
+// An update can now decline to install — an archive whose checksum cannot be
+// fetched or does not match is refused rather than written over the binary that
+// runs every tunnel here. Discarding the log and the error, as this did, meant
+// the panel showed "updating…", reloaded, and left the operator looking at the
+// old version with nothing to explain why. The browser has no other channel to
+// learn that: the CLI prints these lines, the panel has to fetch them.
+var updateProgress = &updateRecord{}
+
+type updateRecord struct {
+	mu      sync.Mutex
+	running bool
+	lines   []string
+	err     string
+}
+
+func (u *updateRecord) start() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.running, u.lines, u.err = true, nil, ""
+}
+
+func (u *updateRecord) log(line string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	// Bounded: a stuck update must not grow this without limit, and only the
+	// tail is of any use when reading back what happened.
+	if len(u.lines) >= 200 {
+		u.lines = u.lines[1:]
+	}
+	u.lines = append(u.lines, line)
+}
+
+func (u *updateRecord) finish(err error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.running = false
+	if err != nil {
+		u.err = err.Error()
+	}
+}
+
+func (u *updateRecord) snapshot() (bool, []string, string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.running, append([]string(nil), u.lines...), u.err
+}
+
+// handleUpdateStatus reports the progress of a running or finished update.
+func (s *server) handleUpdateStatus(w http.ResponseWriter, r *http.Request) {
+	running, lines, errMsg := updateProgress.snapshot()
+	writeJSON(w, map[string]any{"running": running, "log": lines, "error": errMsg})
+}
+
+// handlePanelPort moves the web panel itself to a new port. The response is
+// sent first, then the service restarts — the browser must reconnect on the
+// new port (the frontend handles the redirect).
+func (s *server) handlePanelPort(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.ParseForm()
+	p, err := strconv.Atoi(strings.TrimSpace(r.FormValue("port")))
+	if err != nil || p < 1 || p > 65535 {
+		http.Error(w, "port must be between 1 and 65535", http.StatusBadRequest)
+		return
+	}
+	c := Load()
+	if p == c.Port {
+		writeJSON(w, map[string]any{"status": "ok", "port": p})
+		return
+	}
+	if manage.PortInUse(strconv.Itoa(p)) {
+		http.Error(w, fmt.Sprintf("port %d is already in use", p), http.StatusBadRequest)
+		return
+	}
+	c.Port = p
+	if err := Save(c); err != nil {
+		http.Error(w, "could not save config", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"status": "ok", "port": p})
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		manage.RestartService(app.WebUIService)
+	}()
+}
+
+// passwordFrom reads the new password from a form or, for a panel page cached
+// from before it sent a form, from a JSON body.
+func passwordFrom(w http.ResponseWriter, r *http.Request) (string, error) {
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		var body struct {
+			Password string `json:"password"`
+		}
+		if err := decodeJSON(w, r, &body); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(body.Password), nil
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxLoginBody)
+	if err := r.ParseForm(); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(r.FormValue("password")), nil
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
+}
+
+func randomHex(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// newServer builds a panel with an empty fleet, an empty set of measurements
+// and an empty job registry.
+//
+// One constructor rather than a literal, because there are now three of these
+// and a handler that reaches for a nil one panics on a page nobody was looking
+// at — the reason they are all non-nil and empty rather than lazily created.
+func newServer() *server {
+	return &server{
+		sessions: newSessionStore(),
+		pending:  newPendingStore(),
+		nodes:    &control.Fleet{},
+		net:      control.NewNet(),
+		jobs:     control.NewJobs(),
+		want:     control.NewDesired(),
+	}
+}

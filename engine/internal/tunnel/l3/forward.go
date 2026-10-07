@@ -1,0 +1,524 @@
+package l3
+
+import (
+	"context"
+	"errors"
+	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/backpack/backpack/internal/tunnel/bridge"
+	"github.com/backpack/backpack/internal/tunnel/limits"
+	"github.com/backpack/backpack/internal/tunnel/portmap"
+	"github.com/sirupsen/logrus"
+)
+
+// The forwarder.
+//
+// This is what gives a layer-3 tunnel the same ports = [...] interface the
+// reverse tunnel has. It is intentionally the dullest code in the package: a
+// listener, a dial, and bytes copied between them. Everything that makes the
+// tunnel a tunnel has already happened by the time a packet from here reaches
+// the interface.
+//
+// # Why it runs beside the tunnel rather than inside it
+//
+// The engine restarts on error — a carrier that could not bind, a device that
+// went away — and the forwarder deliberately does not restart with it. A user
+// connection to a forwarded port has no reason to be dropped because the
+// tunnel resealed its session, and rebinding the listeners on every restart
+// would race the ports against the generation replacing them. So the listeners
+// are opened once and outlive any number of tunnel restarts. While the tunnel
+// is down the dial simply fails and the connection is refused, which is both
+// correct and self-healing.
+
+const (
+	// forwardDialTimeout bounds a dial to a backend. Across a tunnel that is
+	// down this is what turns a hang into a refusal.
+	forwardDialTimeout = 10 * time.Second
+
+	// deadBackendRepeat is how often a mapping whose backend keeps refusing
+	// repeats itself. The first failure is said at once; after that a port
+	// under load would otherwise write a line per connection.
+	deadBackendRepeat = time.Minute
+
+	// udpFlowIdle is how long a UDP flow with no traffic is kept before its
+	// socket is released. UDP has no close, so a timer is the only way.
+	udpFlowIdle = 2 * time.Minute
+
+	// udpBufferSize is large enough for any datagram that fits an interface
+	// MTU, with room for a jumbo frame.
+	udpBufferSize = 65535
+)
+
+// ForwardStats is what the forwarder reports.
+type ForwardStats struct {
+	Accepted uint64
+	Refused  uint64
+	Active   int64
+}
+
+// Forwarder serves the configured port mappings.
+type Forwarder struct {
+	mappings  []portmap.Mapping
+	acceptUDP bool
+	log       *logrus.Logger
+
+	// limiter is nil unless the config asked for a cap. It covers the
+	// forwarded ports only — routed traffic goes through the interface and
+	// never passes this way, so there is nothing here to count it.
+	limiter *limits.Limiter
+
+	stats struct {
+		accepted atomic.Uint64
+		refused  atomic.Uint64
+		active   atomic.Int64
+	}
+
+	// ready closes once every listener has finished trying to bind, so a
+	// caller can wait for the sockets to exist instead of guessing. UDP is
+	// why it is here: a TCP client can dial until it connects, but a UDP
+	// sender gets no signal at all, and the guess that stood in for one was
+	// wrong in a way that only showed under load. See Ready.
+	ready     chan struct{}
+	readyOnce sync.Once
+
+	// tunnelUp says whether the tunnel has a session, so a refused port is not
+	// blamed on the far end's service while the tunnel itself is down. Nil
+	// when nobody said, which is read as unknown.
+	tunnelUp func() bool
+
+	// reach records, per mapping, whether its backend is currently answering,
+	// so the log can report the transition rather than the traffic.
+	reach struct {
+		sync.Mutex
+		state map[string]*backendState
+	}
+}
+
+// backendState is what one mapping's backend has been doing lately: whether it
+// was answering the last time anyone tried, and when we last said so.
+type backendState struct {
+	down     bool
+	said     time.Time
+	failures uint64
+}
+
+// NewForwarder builds the forwarder for a configuration, or returns nil when
+// no ports are configured. The mappings are expanded and validated here, so a
+// bad one is reported before any socket is opened.
+func NewForwarder(cfg Config, log *logrus.Logger) (*Forwarder, error) {
+	if len(cfg.Ports) == 0 {
+		return nil, nil
+	}
+	mappings, err := portmap.Expand(cfg.Ports, cfg.PeerIP)
+	if err != nil {
+		return nil, err
+	}
+	if len(mappings) == 0 {
+		return nil, nil
+	}
+	if log == nil {
+		log = logrus.StandardLogger()
+	}
+	return &Forwarder{
+		mappings:  mappings,
+		acceptUDP: cfg.AcceptUDP,
+		log:       log,
+		ready:     make(chan struct{}),
+		limiter: limits.New(limits.Config{
+			MaxConnections: cfg.MaxConnections,
+			BandwidthMbps:  cfg.BandwidthMbps,
+		}),
+	}, nil
+}
+
+// SetTunnelState tells the forwarder how to ask whether the tunnel is up.
+func (f *Forwarder) SetTunnelState(up func() bool) { f.tunnelUp = up }
+
+// Stats returns a snapshot.
+func (f *Forwarder) Stats() ForwardStats {
+	return ForwardStats{
+		Accepted: f.stats.accepted.Load(),
+		Refused:  f.stats.refused.Load(),
+		Active:   f.stats.active.Load(),
+	}
+}
+
+// Ready is closed once every listener has finished trying to bind. It says
+// the sockets are no longer on their way, not that they all came up: a bind
+// that failed is reported by Run and logged, and closing here regardless is
+// what stops a failure becoming a hang.
+//
+// It exists for UDP. A TCP client can dial until it connects, which is what
+// dialUntilReady does in the tests; a UDP sender has nothing equivalent, and
+// the retry loop written in place of one was measurably not the wait it
+// appeared to be — see TestTheForwarderSaysWhenItsListenersAreUp.
+//
+// Waiting on this before Run has been called will block, because nothing is
+// binding yet.
+func (f *Forwarder) Ready() <-chan struct{} { return f.ready }
+
+// Run serves every mapping until ctx ends.
+func (f *Forwarder) Run(ctx context.Context) error {
+	var wg sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
+
+	// One count per listener, dropped as soon as that listener has finished
+	// trying to bind — whether it succeeded or not. Run cannot report
+	// readiness from out here because the binds happen inside the serve
+	// loops, so each of them says when it is past that point.
+	var binding sync.WaitGroup
+	binding.Add(len(f.mappings))
+	if f.acceptUDP {
+		binding.Add(len(f.mappings))
+	}
+	go func() {
+		binding.Wait()
+		f.readyOnce.Do(func() { close(f.ready) })
+	}()
+	// And if Run returns before every listener got that far — a bind that
+	// fails outright takes this path — nobody is left waiting.
+	defer f.readyOnce.Do(func() { close(f.ready) })
+
+	for _, mapping := range f.mappings {
+		wg.Add(1)
+		go func(m portmap.Mapping) {
+			defer wg.Done()
+			if err := f.serveTCP(ctx, m, binding.Done); err != nil && ctx.Err() == nil {
+				// Said out loud as well as returned. A listener that cannot
+				// bind is the single most likely thing to go wrong here, and
+				// what it looks like from the outside is a port that quietly
+				// does nothing.
+				f.log.Errorf("l3: tcp forwarder for %s stopped: %v", m.Listen, err)
+				errOnce.Do(func() { firstErr = err })
+			}
+		}(mapping)
+
+		if f.acceptUDP {
+			wg.Add(1)
+			go func(m portmap.Mapping) {
+				defer wg.Done()
+				if err := f.serveUDP(ctx, m, binding.Done); err != nil && ctx.Err() == nil {
+					f.log.Errorf("l3: udp forwarder for %s stopped: %v", m.Listen, err)
+					errOnce.Do(func() { firstErr = err })
+				}
+			}(mapping)
+		}
+	}
+
+	wg.Wait()
+	// firstErr is only ever set while the context was still live, so returning
+	// it directly cannot turn an ordinary shutdown into a failure.
+	//
+	// It used to be discarded whenever the context had since been cancelled,
+	// which is every shutdown — so a UDP listener that could not bind while TCP
+	// bound fine was swallowed completely: Run blocked on the healthy listener
+	// until cancellation, then reported success. The forwarder went on carrying
+	// TCP with nothing anywhere to say the UDP half had never started.
+	return firstErr
+}
+
+// ---------------------------------------------------------------- tcp
+
+func (f *Forwarder) serveTCP(ctx context.Context, m portmap.Mapping, bound func()) error {
+	listener, err := net.Listen("tcp", m.Listen)
+	// Fired on both paths on purpose: readiness means the socket is no longer
+	// on its way, and a failed bind is as settled as a successful one. Firing
+	// only on success would turn a bind error into a waiter that hangs.
+	bound()
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	go func() { <-ctx.Done(); listener.Close() }()
+
+	f.log.Infof("l3: forwarding tcp %s", m)
+
+	pool := newBackendPool(m.Targets)
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		go f.handleTCP(ctx, conn, m, pool)
+	}
+}
+
+func (f *Forwarder) handleTCP(ctx context.Context, local net.Conn, m portmap.Mapping, pool *backendPool) {
+	defer local.Close()
+
+	if !f.limiter.Acquire() {
+		f.stats.refused.Add(1)
+		f.log.Debugf("l3: connection limit reached, refusing %s", local.RemoteAddr())
+		return
+	}
+	defer f.limiter.Release()
+	local = f.limiter.Wrap(ctx, local)
+
+	f.stats.active.Add(1)
+	defer f.stats.active.Add(-1)
+
+	backend, member, err := pool.dial(ctx, "tcp")
+	if err != nil {
+		f.stats.refused.Add(1)
+		f.noteBackend(m, err)
+		return
+	}
+	defer member.done()
+	defer backend.Close()
+	f.noteBackend(m, nil)
+	f.stats.accepted.Add(1)
+
+	bridge.Join(ctx, local, backend)
+}
+
+// noteBackend reports what the forwarded port is actually doing, which is the
+// one thing a healthy-looking tunnel cannot show on its own.
+//
+// A layer-3 tunnel whose far side has nothing listening on the mapped port
+// looks perfect from every angle an operator can see: both ends log a session,
+// the MTU probe crosses and comes back, ping is clean, rekeys land. The tunnel
+// really is fine — it is the service behind it that is not there. Meanwhile
+// every connection through the port dies on the dial.
+//
+// That failure used to be logged at debug, so the operator was left comparing
+// a green tunnel against a dead port with nothing in between to explain it.
+// It is said out loud now, and said again when the backend comes back, because
+// the recovery is the half that tells them their fix worked.
+func (f *Forwarder) noteBackend(m portmap.Mapping, err error) {
+	f.reach.Lock()
+	defer f.reach.Unlock()
+	if f.reach.state == nil {
+		f.reach.state = make(map[string]*backendState)
+	}
+	st := f.reach.state[m.Listen]
+	if st == nil {
+		st = &backendState{}
+		f.reach.state[m.Listen] = st
+	}
+
+	if err == nil {
+		if st.down {
+			f.log.Infof("l3: %s is answering again on %s, after %d refused connection(s)",
+				strings.Join(m.Targets, ", "), m.Listen, st.failures)
+		}
+		st.down, st.failures = false, 0
+		return
+	}
+
+	st.failures++
+	if st.down && time.Since(st.said) < deadBackendRepeat {
+		return
+	}
+	first := !st.down
+	st.down, st.said = true, time.Now()
+	if first && f.tunnelUp != nil && !f.tunnelUp() {
+		// The tunnel has no session, so nothing could have answered. Saying
+		// "the tunnel itself is up" here sent operators to check a service
+		// that was never the problem, while the handshake lines above said
+		// the far end was not answering at all.
+		f.log.Warnf("l3: connections to %s are being refused because the tunnel is not up yet — "+
+			"no handshake with the other server has completed. See the handshake lines above: "+
+			"the other server is not answering, or the token or carrier differ.", m.Listen)
+		return
+	}
+	if first {
+		// Named in full the first time: the address here is the far end of the
+		// tunnel, and a service listening only on loopback or on the public
+		// address is the usual reason nothing answers on it.
+		f.log.Warnf("l3: nothing is answering %s, so connections to %s are being refused: %v. "+
+			"The tunnel itself is up — check that the service is listening on %s at the far end.",
+			strings.Join(m.Targets, ", "), m.Listen, err, strings.Join(m.Targets, ", "))
+		return
+	}
+	f.log.Warnf("l3: %s still not answering — %d connections to %s refused so far",
+		strings.Join(m.Targets, ", "), st.failures, m.Listen)
+}
+
+// ---------------------------------------------------------------- udp
+
+// udpFlow is one client's conversation with a backend. UDP has no connection,
+// so a flow is recognised by its source address and ends when it goes quiet.
+type udpFlow struct {
+	backend  *net.UDPConn
+	member   *backendMember // counted against it while the flow lives
+	lastSeen atomic.Int64   // unix nanoseconds
+}
+
+func (f *udpFlow) touch() { f.lastSeen.Store(time.Now().UnixNano()) }
+
+func (f *udpFlow) idle(now time.Time, limit time.Duration) bool {
+	return now.Sub(time.Unix(0, f.lastSeen.Load())) > limit
+}
+
+func (f *Forwarder) serveUDP(ctx context.Context, m portmap.Mapping, bound func()) error {
+	conn, err := net.ListenPacket("udp", m.Listen)
+	bound()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	go func() { <-ctx.Done(); conn.Close() }()
+
+	f.log.Infof("l3: forwarding udp %s", m)
+
+	var flows sync.Map // client address string -> *udpFlow
+	defer func() {
+		flows.Range(func(_, v any) bool {
+			v.(*udpFlow).backend.Close()
+			return true
+		})
+	}()
+
+	go f.reapUDPFlows(ctx, &flows)
+
+	pool := newBackendPool(m.Targets)
+	buf := make([]byte, udpBufferSize)
+	for {
+		n, client, err := conn.ReadFrom(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+
+		flow, err := f.udpFlowFor(ctx, &flows, conn, client, pool)
+		if err != nil {
+			f.stats.refused.Add(1)
+			// Left at debug deliberately: this path also reports the
+			// connection limit, and a UDP dial is connectionless and
+			// practically never refuses, so a "nothing is answering"
+			// warning here would usually name the wrong cause.
+			f.log.Debugf("l3: no udp backend for %s: %v", m.Listen, err)
+			continue
+		}
+		flow.touch()
+		if _, err := flow.backend.Write(buf[:n]); err != nil {
+			f.log.Debugf("l3: forwarding udp to %s: %v", m.Targets, err)
+		}
+	}
+}
+
+// udpFlowFor returns the flow for a client, creating it on first sight.
+func (f *Forwarder) udpFlowFor(
+	ctx context.Context,
+	flows *sync.Map,
+	local net.PacketConn,
+	client net.Addr,
+	pool *backendPool,
+) (*udpFlow, error) {
+	key := client.String()
+	if existing, ok := flows.Load(key); ok {
+		return existing.(*udpFlow), nil
+	}
+
+	// A new flow counts against the cap, as a TCP connection does. UDP source
+	// addresses are free to invent, so a flow table keyed on them is the
+	// easiest way to make a host open sockets without limit.
+	if !f.limiter.Acquire() {
+		return nil, errors.New("the connection limit is reached")
+	}
+
+	conn, member, err := pool.dial(ctx, "udp")
+	if err != nil {
+		f.limiter.Release()
+		return nil, err
+	}
+	udpConn, ok := conn.(*net.UDPConn)
+	if !ok {
+		conn.Close()
+		member.done()
+		f.limiter.Release()
+		return nil, errors.New("udp backend did not yield a UDP socket")
+	}
+
+	flow := &udpFlow{backend: udpConn, member: member}
+	flow.touch()
+
+	// Two goroutines could reach here for the same client at once; only one
+	// flow may survive, or the loser's reply reader would write into a socket
+	// nobody is tracking.
+	if actual, loaded := flows.LoadOrStore(key, flow); loaded {
+		udpConn.Close()
+		member.done()
+		f.limiter.Release()
+		return actual.(*udpFlow), nil
+	}
+
+	f.stats.accepted.Add(1)
+	f.stats.active.Add(1)
+	go f.pumpUDPReplies(ctx, flows, key, flow, local, client)
+	return flow, nil
+}
+
+// pumpUDPReplies carries what the backend sends back to the client it belongs
+// to, until the flow is closed or goes quiet.
+func (f *Forwarder) pumpUDPReplies(
+	ctx context.Context,
+	flows *sync.Map,
+	key string,
+	flow *udpFlow,
+	local net.PacketConn,
+	client net.Addr,
+) {
+	defer func() {
+		flows.Delete(key)
+		flow.backend.Close()
+		flow.member.done()
+		f.stats.active.Add(-1)
+		// Paired with the Acquire in udpFlowFor. This pump is where a flow ends
+		// however it ends, so it is the one place the slot is given back.
+		f.limiter.Release()
+	}()
+
+	buf := make([]byte, udpBufferSize)
+	for {
+		// A read deadline rather than a blocking read: it is what lets a flow
+		// whose backend never answers be reaped instead of holding a goroutine
+		// and a socket forever.
+		_ = flow.backend.SetReadDeadline(time.Now().Add(udpFlowIdle))
+		n, err := flow.backend.Read(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() && !flow.idle(time.Now(), udpFlowIdle) {
+				continue // the client is still sending; keep waiting for a reply
+			}
+			return
+		}
+		flow.touch()
+		if _, err := local.WriteTo(buf[:n], client); err != nil {
+			return
+		}
+	}
+}
+
+// reapUDPFlows closes flows that have gone quiet in both directions.
+func (f *Forwarder) reapUDPFlows(ctx context.Context, flows *sync.Map) {
+	ticker := time.NewTicker(udpFlowIdle / 2)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			flows.Range(func(_, v any) bool {
+				if flow := v.(*udpFlow); flow.idle(now, udpFlowIdle) {
+					// Closing wakes the reply pump, which does the removal.
+					flow.backend.Close()
+				}
+				return true
+			})
+		}
+	}
+}

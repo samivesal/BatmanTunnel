@@ -1,0 +1,211 @@
+/* metrics — everything this screen needs, ported from metrics.html.
+ * Self-contained on purpose: injected when the screen opens and removed
+ * when it closes, so two screens can never fight over a rule.
+ */
+
+body[data-t="dark"]{background:#070707;color:#fafafa;
+    --bg:#070707;--s1:#111111;--s2:#181818;--s3:#1f1f1f;
+    --ln:rgba(255,255,255,.08);--ln2:rgba(255,255,255,.15);--ln3:rgba(255,255,255,.3);
+    --tx:#fafafa;--tx2:#dcdcdc;--mu:#8e8e8e;--dim:#606060;--faint:#3d3d3d;
+    --sunk:rgba(255,255,255,.05);--field:#0c0c0c;
+    --lift:0 22px 50px -24px rgba(0,0,0,.95);--spark:#e8e8e8}
+body[data-t="light"]{background:#f2f2f2;color:#0a0a0a;
+    --bg:#f2f2f2;--s1:#ffffff;--s2:#fafafa;--s3:#f4f4f4;
+    --ln:rgba(0,0,0,.09);--ln2:rgba(0,0,0,.16);--ln3:rgba(0,0,0,.34);
+    --tx:#0a0a0a;--tx2:#2e2e2e;--mu:#6b6b6b;--dim:#949494;--faint:#c4c4c4;
+    --sunk:rgba(0,0,0,.045);--field:#ffffff;
+    --lift:0 22px 46px -26px rgba(0,0,0,.32);--spark:#1a1a1a}
+@media (max-width:780px){.cell.open{grid-column:span 1}}
+.c7{background:var(--s1);border:1px solid var(--ln);border-radius:18px;position:relative;overflow:hidden;
+    display:flex;flex-direction:column;min-height:318px;transition:border-color .3s var(--spring)}
+.c7 .hd,.ed .eh{display:flex;align-items:center;gap:10px}
+.fl{width:30px;height:30px;border-radius:9px;background:var(--s3);border:1px solid var(--ln);
+    display:grid;place-items:center;font-size:15px;flex:none}
+.c7 .id b{display:block;font-size:14.5px;font-weight:640;letter-spacing:-.022em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.c7 .id small{display:block;font-size:11px;color:var(--dim);margin-top:1px}
+.dot{width:7px;height:7px;border-radius:50%;flex:none;display:block;background:var(--ok);animation:bp 2.6s ease-out infinite}
+@keyframes bp{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--ok) 45%,transparent)}70%{box-shadow:0 0 0 9px transparent}100%{box-shadow:0 0 0 0 transparent}}
+.c7 .kind span{font-size:10.5px;font-weight:620;letter-spacing:.04em;text-transform:uppercase;padding:3px 8px;border-radius:6px;background:var(--sunk);color:var(--mu)}
+.c7 .kind span.q{background:transparent;border:1px solid var(--ln);color:var(--dim);text-transform:none;letter-spacing:0;font-weight:560}
+.relay{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;font-weight:620;padding:5px 9px 5px 7px;
+  border-radius:8px;background:var(--sunk);border:1px solid var(--ln);color:var(--tx2)}
+.relay svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.dlg.logs{width:min(760px,100%);max-height:88vh}
+.dlg .bar2{display:flex;align-items:center;gap:10px;padding:11px 18px;border-bottom:1px solid var(--ln)}
+.dlg .bar2 .sp{flex:1}
+.dlg .live{display:inline-flex;align-items:center;gap:7px;font-size:11.5px;font-weight:580;color:var(--mu)}
+.dlg .live i{width:7px;height:7px;border-radius:50%;background:var(--ok);display:block;animation:lp 2.2s ease-out infinite}
+@keyframes lp{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--ok) 45%,transparent)}70%{box-shadow:0 0 0 8px transparent}100%{box-shadow:0 0 0 0 transparent}}
+.dlg .live.paused i{background:var(--dim);animation:none}
+.dlg .tool{font:inherit;font-size:11.5px;font-weight:580;padding:7px 12px;border-radius:10px;cursor:pointer;
+  background:var(--sunk);border:1px solid var(--ln);color:var(--tx2);display:inline-flex;align-items:center;gap:7px;
+  transition:background .22s ease,color .22s ease,transform .12s ease-out}
+.dlg .tool:hover{background:var(--ln);color:var(--tx)}
+.dlg .tool:active{transform:scale(.96)}
+.dlg .tool svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+.dlg .tool.on{background:var(--tx);color:var(--bg);border-color:var(--tx)}
+.dlg .diag{margin:14px 18px 0;border:1px solid color-mix(in srgb,var(--wr) 34%,transparent);border-radius:12px;
+  background:color-mix(in srgb,var(--wr) 8%,transparent);padding:12px 13px;display:flex;gap:11px;align-items:flex-start}
+.dlg .diag .ic{width:26px;height:26px;border-radius:8px;flex:none;display:grid;place-items:center;
+  background:color-mix(in srgb,var(--wr) 20%,transparent);color:var(--wr);font-size:13px;font-weight:700}
+.dlg .diag .tx{flex:1;min-width:0}
+.dlg .diag .tx b{display:block;font-size:12.5px;font-weight:620;margin-bottom:3px}
+.dlg .diag .tx .detail{font-size:11.5px;color:var(--tx2);line-height:1.55}
+.dlg .diag .tx .fix{font-size:11.5px;color:var(--mu);line-height:1.55;margin-top:6px;padding-top:6px;
+  border-top:1px solid color-mix(in srgb,var(--wr) 22%,transparent)}
+.dlg .diag .tx .fix b{display:inline;font-weight:620;color:var(--tx2)}
+.dlg .diag .x2{width:22px;height:22px;border-radius:6px;border:1px solid transparent;background:transparent;
+  color:var(--dim);cursor:pointer;display:grid;place-items:center;flex:none}
+.dlg .diag .x2:hover{background:color-mix(in srgb,var(--wr) 14%,transparent);color:var(--wr)}
+.dlg .diag .x2 svg{width:11px;height:11px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round}
+.dlg .logwrap{position:relative;flex:1;min-height:0;display:flex;flex-direction:column}
+.dlg .log{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:10px 0 12px;
+  scrollbar-width:thin;scrollbar-color:var(--ln2) transparent}
+.dlg .log::-webkit-scrollbar{width:9px}
+.dlg .log::-webkit-scrollbar-thumb{background:var(--ln2);border-radius:5px;border:2px solid transparent;background-clip:content-box}
+.dlg .ln{display:grid;grid-template-columns:74px 62px 1fr;gap:12px;padding:4px 18px;font-size:12px;line-height:1.55;
+  align-items:baseline}
+.dlg .ln:hover{background:var(--sunk)}
+.dlg .ln .t{color:var(--dim);font-variant-numeric:tabular-nums;letter-spacing:-.01em;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
+.dlg .ln .lv{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
+.dlg .ln .lv.info{color:var(--dim)}
+.dlg .ln .lv.warn{color:var(--wr)}
+.dlg .ln .lv.error{color:var(--er)}
+.dlg .ln .msg{color:var(--tx2);word-break:break-word;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px}
+.dlg .ln.error .msg{color:var(--tx)}
+.dlg .ln.fresh{animation:arrive .34s cubic-bezier(.32,.72,0,1)}
+@keyframes arrive{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.dlg .ln[hidden]{display:none}
+.dlg .jump{position:absolute;left:50%;bottom:12px;transform:translateX(-50%);z-index:3;
+  font:inherit;font-size:11.5px;font-weight:600;padding:8px 14px;border-radius:20px;cursor:pointer;
+  background:var(--tx);color:var(--bg);border:0;box-shadow:0 8px 22px -8px rgba(0,0,0,.7);
+  display:none;align-items:center;gap:7px}
+.dlg .jump.on{display:inline-flex;animation:arrive .3s cubic-bezier(.32,.72,0,1)}
+.dlg .jump svg{width:12px;height:12px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:120;
+  background:var(--tx);color:var(--bg);font-size:12.5px;font-weight:580;padding:11px 16px;border-radius:12px;
+  box-shadow:0 14px 34px -12px rgba(0,0,0,.7);display:none;max-width:min(520px,92vw);line-height:1.5}
+.toast.on{display:block;animation:arrive .32s cubic-bezier(.32,.72,0,1)}
+.dlg.met{width:min(720px,100%);max-height:88vh}
+.dlg .mbody{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;
+  scrollbar-width:thin;scrollbar-color:var(--ln2) transparent}
+.dlg .mbody::-webkit-scrollbar{width:9px}
+.dlg .mbody::-webkit-scrollbar-thumb{background:var(--ln2);border-radius:5px;border:2px solid transparent;background-clip:content-box}
+.dlg .sec2{display:flex;align-items:center;gap:9px;padding:20px 18px 9px}
+.dlg .sec2 h4{font-size:10.5px;font-weight:660;letter-spacing:.09em;text-transform:uppercase;color:var(--dim);white-space:nowrap}
+/* The rule beside a section title. It shares its class name with a log line
+   (.dlg .ln above, a three-column grid with padding), and inherited all of it:
+   on a phone the rule became a padded grid wider than the dialog, ran off the
+   right edge and left a bar through the row under it. */
+.dlg .sec2 .ln{flex:1;height:1px;background:var(--ln);display:block;padding:0;min-width:0;
+  grid-template-columns:none;font-size:0;animation:none}
+.dlg .sec2 .ln:hover{background:var(--ln)}
+.dlg .sec2 .badge2{font-size:10px;font-weight:620;padding:2px 7px;border-radius:6px;background:var(--sunk);color:var(--dim)}
+.dlg .sec2 svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;color:var(--dim)}
+.dlg .dl{padding:0 18px}
+.dlg .dr2{display:flex;align-items:baseline;gap:12px;padding:7px 0;border-bottom:1px solid var(--ln);font-size:12.5px}
+.dlg .dl .dr2:last-child{border-bottom:0}
+.dlg .dr2 .k2{color:var(--mu);flex:none;min-width:132px}
+.dlg .dr2 .v2{margin-left:auto;text-align:right;font-weight:570;font-variant-numeric:tabular-nums;letter-spacing:-.008em}
+.dlg .dr2.wide{display:block}
+.dlg .dr2.wide .k2{display:block;margin-bottom:4px;min-width:0}
+.dlg .dr2.wide .v2{margin-left:0;text-align:left;font-weight:500;color:var(--tx2);line-height:1.55;font-variant-numeric:normal}
+.dlg .chartbox{padding:6px 18px 4px}
+.dlg .chartbox svg{display:block;width:100%}
+.dlg .key{display:flex;align-items:center;gap:14px;padding:6px 18px 0;font-size:11px;color:var(--dim)}
+.dlg .key i{display:inline-block;width:12px;height:2px;border-radius:2px;margin-right:6px;vertical-align:3px;background:var(--tx2)}
+.dlg .key i.q{width:2px;height:11px;background:var(--dim);vertical-align:-1px;margin-right:7px}
+.dlg .upt{display:flex;gap:20px;padding:4px 18px 0}
+.dlg .upt .u2 .k2{font-size:11px;color:var(--dim)}
+.dlg .upt .u2 .v2{font-size:19px;font-weight:640;letter-spacing:-.028em;margin-top:2px;font-variant-numeric:tabular-nums}
+.dlg .lt{margin:8px 18px 0;border:1px solid var(--ln);border-radius:12px;background:var(--field);padding:12px 13px;
+  display:flex;align-items:center;gap:12px}
+.dlg .lt .tx{flex:1;font-size:11.5px;color:var(--mu);line-height:1.5}
+.dlg .lt .tx b{color:var(--tx2);font-weight:600}
+.dlg .ch2{margin:8px 18px 0;border:1px solid var(--ln);border-radius:12px;overflow:hidden;background:var(--field)}
+.dlg .ch2 .row2{display:flex;align-items:center;gap:11px;padding:11px 13px;border-bottom:1px solid var(--ln);font-size:12.5px}
+.dlg .ch2 .row2:last-child{border-bottom:0}
+.dlg .ch2 .row2 .when{color:var(--mu);font-variant-numeric:tabular-nums;flex:none;min-width:96px;font-size:11.5px}
+.dlg .ch2 .row2 .what{flex:1;color:var(--tx2);min-width:0}
+.dlg .ch2 .row2 .mini2{font:inherit;font-size:11px;font-weight:580;padding:5px 10px;border-radius:8px;cursor:pointer;
+  background:var(--sunk);border:1px solid var(--ln);color:var(--tx2)}
+.dlg .ch2 .row2 .mini2:hover{background:var(--ln);color:var(--tx)}
+.dlg .chip2{display:inline-flex;align-items:center;gap:7px;font-size:11px;font-weight:620;padding:5px 10px;border-radius:9px}
+.dlg .chip2.o{background:color-mix(in srgb,var(--ok) 15%,transparent);color:var(--ok)}
+.dlg .chip2.w{background:color-mix(in srgb,var(--wr) 16%,transparent);color:var(--wr)}
+.dlg .chip2 i{width:6px;height:6px;border-radius:50%;background:currentColor}
+
+/* ---- the metric block ----------------------------------------------------
+ *
+ * Legend, chart, figures — read top to bottom. Two named series over a ruled
+ * ground, then the headline numbers with what each did since the reading
+ * before it.
+ */
+/* The legend sits straight in the scrolling body — above the first chart, and
+   above the 24-hour one where setSection puts it — so it keeps the same 18px
+   gutter as everything around it. Without it "Down · Up" was pressed against
+   the dialog's left edge while the chart under it was inset. */
+.dlg .mlegend{display:flex;gap:16px;align-items:center;margin:0;padding:6px 18px 8px}
+.dlg .mbody > .mlegend:first-child{padding-top:16px}
+.dlg .mlegend span{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--mu)}
+.dlg .mlegend i{width:10px;height:10px;border-radius:3px;flex:none}
+
+/* Gridlines behind, not under: they are a ruler, and a ruler that draws
+   attention is a worse ruler. */
+.dlg .chartbox .gl{stroke:color-mix(in srgb,var(--tx) 9%,transparent);stroke-width:1;
+  vector-effect:non-scaling-stroke}
+.dlg .chartbox .chg{stroke:var(--dim);stroke-width:1;stroke-dasharray:2 3;
+  vector-effect:non-scaling-stroke}
+.dlg .chartbox .ln{stroke-width:2;stroke-linecap:round;stroke-linejoin:round;
+  vector-effect:non-scaling-stroke}
+.dlg .chartbox .tk{font-size:9.5px;fill:var(--dim)}
+
+/* One figure a row, divided, each arriving a beat after the one above.
+ *
+ * The 18px is the gutter every other block on this screen already keeps — the
+ * section headings, the chart above these rows, its legend, the tables below.
+ * These three sat directly in the body with none, so the one part of the screen
+ * that is pure reading ran edge to edge while everything around it was inset,
+ * and the figures looked pushed into the corners of the dialog. */
+.dlg .mrows{margin:14px 0 4px;padding:0 18px}
+.dlg .mrow{display:flex;align-items:center;gap:10px;padding:13px 0;
+  border-top:1px solid var(--ln)}
+.dlg .mrow:first-child{border-top:0}
+.dlg .mrow .mk{display:flex;align-items:center;gap:9px;flex:1;min-width:0;
+  font-size:12.5px;color:var(--mu)}
+.dlg .mrow .mk span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dlg .mrow .mk svg{width:17px;height:17px;flex:none;fill:none;stroke:var(--dim);
+  stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.dlg .mrow .mv{display:flex;align-items:center;gap:10px;flex:none;
+  font-size:17px;font-weight:620;letter-spacing:-.02em;color:var(--tx);
+  font-variant-numeric:tabular-nums}
+
+/* The trend badge: a round tint with an arrow, the colour of what it means. */
+.dlg .mtr{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;
+  font-size:12px;font-weight:700;flex:none}
+.dlg .mtr.up{background:color-mix(in srgb,var(--ok) 22%,transparent);color:var(--ok)}
+.dlg .mtr.down{background:color-mix(in srgb,var(--er) 22%,transparent);color:var(--er)}
+.dlg .mtr.flat{background:color-mix(in srgb,var(--mu) 20%,transparent);color:var(--mu)}
+
+.dlg .mrow{animation:mrIn .38s var(--spring) both}
+.dlg .mrow:nth-child(2){animation-delay:.05s}
+.dlg .mrow:nth-child(3){animation-delay:.1s}
+@keyframes mrIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){ .dlg .mrow{animation:none} }
+
+.dlg .chip2.x{background:color-mix(in srgb,var(--er) 15%,transparent);color:var(--er)}
+.dlg .chip2.n{background:var(--sunk);color:var(--mu)}
+.dlg .mbody{padding-bottom:18px}
+.dlg .mbody > .dl:first-child{padding-top:14px}
+@media (max-width:560px){
+  .dlg .dr2 .k2{min-width:0}
+  .dlg .dr2{flex-wrap:wrap}
+  .dlg .sec2,.dlg .dl,.dlg .chartbox,.dlg .mlegend,.dlg .mrows{padding-left:14px;padding-right:14px}
+  .dlg .lt,.dlg .ch2{margin-left:14px;margin-right:14px}
+}
+
+/* The times under a chart, as type rather than as part of the drawing. */
+.dlg .mticks{display:flex;justify-content:space-between;margin-top:5px;
+  font-size:9.5px;color:var(--dim);font-variant-numeric:tabular-nums}

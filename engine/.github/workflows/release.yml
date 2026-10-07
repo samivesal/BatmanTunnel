@@ -1,0 +1,94 @@
+name: Release
+
+# Publishes the assets for a tag. A tag containing a suffix (v1.6.0-beta.1) is
+# published as a pre-release, which is what the Beta release channel installs.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test before publishing
+        # Nothing gets published that has not passed the suite. A broken
+        # release is far more expensive to undo than a slow pipeline.
+        run: go test ./... -timeout 20m
+
+      - name: Build release assets
+        # RELEASE_SIGNING_KEY signs release/SHA256SUMS. Without it the build
+        # still produces every asset and simply publishes no signature, which
+        # is what a fork gets — and what this repository got until a key was
+        # generated. See tools/signsums and internal/manage/releasesig.go.
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: make release
+
+      - name: Verify the tag matches the built version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          declared="$(tr -d ' \n' < VERSION)"
+          # A pre-release tag (v1.6.0-beta.1) carries the version it is a
+          # pre-release of, so compare only the part before the suffix.
+          base="${tag%%-*}"
+          if [ "$base" != "$declared" ]; then
+            echo "Tag $tag does not match VERSION ($declared)."
+            exit 1
+          fi
+
+      - name: Mark pre-releases
+        id: kind
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Release notes from CHANGELOG
+        # The release description is this tag's section of CHANGELOG.md — from
+        # its "## <tag>" heading up to the next version heading.
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          awk -v h="## ${tag}" '
+            index($0, h) == 1 { f = 1; next }
+            f && /^## v/ { exit }
+            f { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "Backpack ${tag}" > RELEASE_NOTES.md
+          fi
+
+      - name: Publish
+        # Pinned to a commit, not the moving v2 tag: this job holds
+        # RELEASE_SIGNING_KEY, and steps in a job share a runner — so whoever
+        # can repoint that tag can read the one secret the whole update
+        # verification design rests on. Update deliberately, with the tag the
+        # SHA belongs to written beside it.
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          prerelease: ${{ steps.kind.outputs.prerelease }}
+          body_path: RELEASE_NOTES.md
+          # Every archive make release produced, by glob rather than by name.
+          #
+          # Listing them one by one is how five of the seven architectures came
+          # to be built and then not published: the build learned about them and
+          # this did not, and nothing failed — the assets simply were not there,
+          # and an update on those machines 404s.
+          files: |
+            release/backpack_linux_*.tar.gz
+            release/SHA256SUMS
+            release/SHA256SUMS.sig
+            release/SBOM.txt
+            install.sh

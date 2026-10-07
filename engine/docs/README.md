@@ -1,0 +1,92 @@
+# Backpack docs
+
+Reference pages: what each part of Backpack **is**, and every setting it has.
+
+- [Architecture](architecture.md) — what the project is made of and where each part lives
+- Looking for a **step-by-step setup**? → [`tutorial/`](../tutorial/README.md)
+- Looking for the **overview and install**? → [main README](../README.md)
+
+### Start here
+- [The CLI menu — complete reference](cli-menu.md) — every option in every menu,
+  including the advanced Fine Tune settings
+- [Server layout (file locations)](server-layout.md)
+
+### Tunnel direction
+- [Direct tunnel — stream transports](direct-tunnel.md) — the `[direct]` engine, no longer offered by the wizard; the same forwarded ports, with Iran dialling
+  out instead of waiting to be dialled
+- [Direct tunnel](l3-direct-tunnel.md) — **what the wizard builds**: a private network between the two
+  servers, carrying whole IP packets (GRE/IPIP over a TUN device)
+
+### Transports
+- [Transports — every one explained](transports.md)
+- [Choosing a transport (Link Test)](choosing-a-transport.md)
+- [TCP + PCK](tcp-pck.md) — TCP without the kernel's TCP stack
+- [IP Spoofing](ip-spoofing.md) — the forged-source carrier, setting by setting
+- [Decoy site (WSS camouflage)](camouflage.md)
+- [When a server is filtered, blocked, or dirty](filtered-or-dirty-ip.md)
+
+### Per-tunnel settings
+- [Configuration reference](config-reference.md) — every key Backpack reads, generated from the declarations.
+- [Performance notes](performance-notes.md) — where the time goes, and the measurements that closed a question.
+- [Design decisions](design-decisions.md) — what Backpack deliberately does not do,
+  and the reason for each refusal.
+- [Releasing](releasing.md) — the checklist, and what happens if the signing key is lost.
+- [Troubleshooting](troubleshooting.md) — what to check when a tunnel is up and carrying nothing, in order.
+- [Access control](access-control.md) — scopes, API tokens for scrapers, and the record of what was done.
+- [Transport fallback](transport-fallback.md) — what a tunnel does when its carrier stops getting through.
+- [Port mappings](port-mappings.md) — every form `ports = [...]` accepts, including
+  binding a listener to one local IP on a multi-homed server
+- [Forwarded UDP](forwarded-udp.md) — the one to read when UDP does not pass
+- [Performance presets](performance-presets.md) — Balance / Turbo / Aggressive / Throughput
+- [Failover & load balancing](failover-load-balancing.md) — backup addresses, health scoring
+- [Real client IP (PROXY protocol)](real-client-ip.md)
+- [Per-tunnel limits](limits.md)
+- [TCP MSS clamp](mss-clamp.md)
+
+### Monitoring
+- [Web panel](web-panel.md)
+- [The web panel, screen by screen](web-panel-screens.md) — every screen, its
+  address, and the CLI entry that does the same job
+- [Managed servers (nodes)](managed-servers.md) — register a foreign server with
+  the panel once, then build both ends of a tunnel from one screen, with no SSH
+  and no login held for that machine
+- [Telegram bot](telegram-bot.md)
+- [Alerts](alerts.md)
+- [Tunnel Metrics](tunnel-metrics.md)
+- [Health Check](health-check.md)
+- [Monitor service](monitor-service.md)
+- [Shipping logs off the server](log-schema.md) — JSON logs, the field names, and
+  two collector recipes
+
+### Maintenance
+- [Backup & restore](backup-restore.md)
+- [Updates & rollback](updates.md)
+
+---
+
+<div dir="rtl">
+
+## خلاصهٔ فارسی
+
+این پوشه **مرجع** است: هر بخش بک‌پک چیست و چه تنظیماتی دارد. اگر دنبال
+**آموزش قدم‌به‌قدم راه‌اندازی** هستی، به [`tutorial/`](../tutorial/README.md) برو.
+
+از کجا شروع کنی: [مرجع کامل منوی CLI](cli-menu.md) تک‌تک گزینه‌های همهٔ منوها را
+توضیح می‌دهد، از جمله تنظیمات پیشرفتهٔ Fine Tune.
+
+پرکاربردترین صفحه‌ها: [ترنسپورت‌ها](transports.md)،
+[Forwarded UDP](forwarded-udp.md) (وقتی UDP رد نمی‌شود)،
+[پریست‌های کارایی](performance-presets.md)،
+[فِیل‌اوور و لود بالانس](failover-load-balancing.md) و
+[IP Spoofing](ip-spoofing.md).
+
+هر صفحه در انتها یک خلاصهٔ فارسی دارد.
+
+</div>
+
+---
+[← Back to the main README](../README.md)
+
+---
+
+*Last verified against Backpack v1.8.5.*

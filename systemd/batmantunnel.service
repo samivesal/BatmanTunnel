@@ -1,0 +1,27 @@
+[Unit]
+Description=BatmanTunnel adaptive paired tunnel
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+ConditionPathExists=/etc/batmantunnel/node.json
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/batmantunnel
+ExecStart=/usr/bin/python3 -m batmantunnel.cli run
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/batmantunnel/notifications.env
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=25
+UMask=0077
+LimitNOFILE=65536
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+ReadWritePaths=/etc/batmantunnel
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

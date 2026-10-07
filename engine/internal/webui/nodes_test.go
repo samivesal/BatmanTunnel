@@ -1,0 +1,633 @@
+package webui
+
+import (
+	"encoding/json"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/backpack/backpack/internal/manage"
+	"github.com/backpack/backpack/internal/node"
+)
+
+// The fleet endpoints.
+//
+// What is worth holding still here is not that they return JSON. It is that a
+// panel with the feature turned off cannot be talked into acting on a node, and
+// that the one thing this feature is for — an edit reaching both ends — is
+// reported honestly when only one of them took it.
+
+// isolateFleet points the fleet's two state files at a temp directory, so a
+// test never reads or writes the machine it runs on.
+func isolateFleet(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	oldStore, oldPairs := node.StorePath, manage.NodePairPath
+	node.StorePath = filepath.Join(dir, "nodes.json")
+	manage.NodePairPath = filepath.Join(dir, "node-pairs.json")
+	t.Cleanup(func() { node.StorePath, manage.NodePairPath = oldStore, oldPairs })
+}
+
+func newFleetServer() *server { return newServer() }
+
+// fakeRunner stands in for a fleet of real machines.
+//
+// The transport is SSH now, so a test that wanted a live node would need a
+// second computer. What the panel's own behaviour depends on is narrower than
+// that: whether a server answers, and what it says — so that is what is
+// substituted, and every path through the handlers is exercised for real.
+type fakeRunner struct {
+	up      map[string]bool
+	answers map[string]any   // op -> what it returns
+	fail    map[string]error // op -> what it refuses with
+	calls   []string
+	forgot  []string
+}
+
+func newFake() *fakeRunner {
+	return &fakeRunner{up: map[string]bool{}, answers: map[string]any{}, fail: map[string]error{}}
+}
+
+func (f *fakeRunner) Call(name, op string, body, out any) error {
+	f.calls = append(f.calls, name+":"+op)
+	if !f.up[name] {
+		return node.ErrOffline{Name: name, Why: "no route to host"}
+	}
+	if err := f.fail[op]; err != nil {
+		return err
+	}
+	if v, ok := f.answers[op]; ok && out != nil {
+		b, _ := json.Marshal(v)
+		return json.Unmarshal(b, out)
+	}
+	return nil
+}
+
+func (f *fakeRunner) IsOnline(name string) bool { return f.up[name] }
+
+func (f *fakeRunner) Reachable(name string) (bool, string) {
+	if f.up[name] {
+		return true, ""
+	}
+	return false, "no route to host"
+}
+
+func (f *fakeRunner) Forget(name string) { f.forgot = append(f.forgot, name) }
+
+// withFleet puts a stand-in behind the panel's fleet.
+func withFleet(s *server, f *fakeRunner) { s.nodes.Use(f) }
+
+func post(t *testing.T, s *server, form string) *httptest.ResponseRecorder {
+	t.Helper()
+	r := httptest.NewRequest("POST", "/api/nodes", strings.NewReader(form))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	// Signed in, as the operator on the fleet page is: adding a server and
+	// changing its credentials are admin actions (nodeActionScope).
+	r.RemoteAddr = "192.0.2.10:1"
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: s.sessions.create("192.0.2.10")})
+	w := httptest.NewRecorder()
+	s.handleNodes(w, r)
+	return w
+}
+
+// A panel that manages nothing says so, and cannot be talked into acting on a
+// server that is not there.
+//
+// What used to be here also checked that the feature was off until switched on.
+// There is no switch: it guarded listeners the panel had to open, and the panel
+// dials out now — an empty fleet is already the off state.
+func TestAnEmptyFleetIsEmptyAndActsOnNothing(t *testing.T) {
+	isolateFleet(t)
+	s := newFleetServer()
+	t.Cleanup(s.nodes.Stop)
+
+	r := httptest.NewRequest("GET", "/api/nodes", nil)
+	w := httptest.NewRecorder()
+	s.handleNodes(w, r)
+	var state struct {
+		Nodes []any `json:"nodes"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &state)
+	if len(state.Nodes) != 0 {
+		t.Errorf("a panel that has never used the feature reports %d servers", len(state.Nodes))
+	}
+
+	// And nothing can be pushed to a server that does not exist.
+	body, _ := json.Marshal(map[string]any{"node": "kharej", "kind": "reverse"})
+	rq := httptest.NewRequest("POST", "/api/node/pair", strings.NewReader(string(body)))
+	wr := httptest.NewRecorder()
+	s.handleNodePair(wr, rq)
+	if wr.Code == http.StatusOK {
+		t.Error("a tunnel was paired with a server that is not in the fleet")
+	}
+}
+
+// Turning it on and adding a server issues a usable command on that server's
+// own port.
+// Adding a server is one round trip to it, and the fleet only keeps what
+// answered.
+//
+// The flow this replaces saved the details first and found out whether they
+// worked later — which is how a server came to sit in the fleet doing nothing
+// with nothing saying why. A login that does not work is a typo, and a typo is
+// worth reporting while the operator is still looking at the form.
+func TestAddingAServerKeepsOnlyWhatAnswers(t *testing.T) {
+	isolateFleet(t)
+	s := newFleetServer()
+	t.Cleanup(s.nodes.Stop)
+
+	f := newFake()
+	withFleet(s, f)
+
+	// The form is checked before anything is dialled.
+	for _, bad := range []struct{ what, form string }{
+		{"no address", "action=add&name=kharej&host=&user=root&password=x"},
+		{"no password", "action=add&name=kharej&host=203.0.113.9&user=root&password="},
+		{"a bad name", "action=add&name=kha%2Frej&host=203.0.113.9&user=root&password=x"},
+		{"a bad ssh port", "action=add&name=kharej&host=203.0.113.9&user=root&password=x&sshPort=0"},
+	} {
+		if w := post(t, s, bad.form); w.Code == http.StatusOK {
+			t.Errorf("a server with %s was accepted", bad.what)
+		}
+	}
+
+	// A server that does not answer is not kept.
+	if w := post(t, s, "action=add&name=kharej&host=203.0.113.9&user=root&password=x"); w.Code == http.StatusOK {
+		t.Error("a server that could not be reached was added anyway")
+	}
+	if len(node.List()) != 0 {
+		t.Errorf("an unreachable server was left in the fleet: %+v", node.List())
+	}
+
+	// One that does is.
+	f.up["kharej"] = true
+	f.answers[node.OpHello] = node.Info{Version: "v1.7.6", OS: "Ubuntu 24.04"}
+	if w := post(t, s, "action=add&name=kharej&host=203.0.113.9&user=root&password=x"); w.Code != http.StatusOK {
+		t.Fatalf("add: %d %s", w.Code, w.Body.String())
+	}
+	got := node.List()
+	if len(got) != 1 {
+		t.Fatalf("the fleet holds %d servers", len(got))
+	}
+	if got[0].Host != "203.0.113.9" || got[0].User != "root" {
+		t.Errorf("the server was stored as %+v", got[0])
+	}
+	if got[0].Password != "" {
+		t.Error("List handed out the password")
+	}
+	if got[0].Info.Version != "v1.7.6" {
+		t.Errorf("what the server said about itself was not kept: %+v", got[0].Info)
+	}
+
+	// The same machine twice is a mistake worth catching: two names for one
+	// server means two cards that disagree about it.
+	if w := post(t, s, "action=add&name=other&host=203.0.113.9&user=root&password=x"); w.Code == http.StatusOK {
+		t.Error("the same address was added twice")
+	}
+
+	// Removing it drops the connection with the record.
+	if w := post(t, s, "action=remove&name=kharej"); w.Code != http.StatusOK {
+		t.Fatalf("remove: %d %s", w.Code, w.Body.String())
+	}
+	if len(node.List()) != 0 {
+		t.Error("the server is still in the fleet")
+	}
+	if len(f.forgot) == 0 || f.forgot[0] != "kharej" {
+		t.Error("the connection to a removed server was left open")
+	}
+}
+
+// The password is never sent to the browser, and changing the address forgets
+// the host key — a different machine is entitled to a different one.
+func TestCredentialsCanBeChangedAndAreNeverSentBack(t *testing.T) {
+	isolateFleet(t)
+	s := newFleetServer()
+	t.Cleanup(s.nodes.Stop)
+	f := newFake()
+	f.up["kharej"] = true
+	withFleet(s, f)
+	post(t, s, "action=add&name=kharej&host=203.0.113.9&user=root&password=first")
+
+	if err := node.NoteFingerprint("kharej", "SHA256:abc"); err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	if w := post(t, s, "action=credentials&name=kharej&host=198.51.100.7&password=second"); w.Code != http.StatusOK {
+		t.Fatalf("credentials: %d %s", w.Code, w.Body.String())
+	}
+	n, _ := node.Find("kharej")
+	if n.Host != "198.51.100.7" {
+		t.Errorf("the address was not changed: %s", n.Host)
+	}
+	if n.Fingerprint != "" {
+		t.Error("the host key from the old address was kept for the new one")
+	}
+
+	r := httptest.NewRequest("GET", "/api/nodes", nil)
+	w := httptest.NewRecorder()
+	s.handleNodes(w, r)
+	if strings.Contains(w.Body.String(), "first") || strings.Contains(w.Body.String(), "second") {
+		t.Error("the fleet listing carries the server's password")
+	}
+	if !strings.Contains(w.Body.String(), "198.51.100.7") {
+		t.Error("the fleet listing does not say where the server is")
+	}
+}
+
+// The point of the feature: an edit that cannot reach the other end says so,
+// names the server, and does not report plain success.
+func TestAnEditThatCannotReachTheNodeSaysSo(t *testing.T) {
+	isolateFleet(t)
+	s := newFleetServer()
+
+	if err := manage.NoteNodePair("fr-relay", "kharej-de", "fr-relay-kharej"); err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	r := httptest.NewRequest("POST", "/api/tunnel/edit", nil)
+	out := s.afterEdit("fr-relay", r)
+
+	if out["status"] != "partial" {
+		t.Errorf("an edit that never reached the node reported %v", out["status"])
+	}
+	if out["node"] != "kharej-de" {
+		t.Errorf("the reply does not name the server: %v", out["node"])
+	}
+	for _, k := range []string{"peerError", "peerHint"} {
+		if v, _ := out[k].(string); !strings.Contains(v, "kharej-de") {
+			t.Errorf("%s does not tell the operator which end is behind: %q", k, v)
+		}
+	}
+
+	// An unpaired tunnel is the ordinary case and gains nothing.
+	plain := s.afterEdit("some-other-tunnel", r)
+	if plain["status"] != "ok" || plain["node"] != nil {
+		t.Errorf("an unpaired edit was reported as %v", plain)
+	}
+}
+
+// A pairing is remembered until one end of it goes, and removing the server
+// forgets every tunnel on it — otherwise a later edit reports a node that is no
+// longer in the fleet.
+func TestPairingsAreForgottenWithTheirServer(t *testing.T) {
+	isolateFleet(t)
+
+	manage.NoteNodePair("fr-relay", "kharej-de", "fr-relay-kharej")
+	manage.NoteNodePair("de-edge", "kharej-de", "de-edge-kharej")
+	manage.NoteNodePair("nl-ws", "kharej-nl", "nl-ws-kharej")
+
+	if got := manage.TunnelsOnNode("kharej-de"); len(got) != 2 {
+		t.Fatalf("tunnels on kharej-de: %v", got)
+	}
+	if err := manage.ForgetNodePairs("kharej-de"); err != nil {
+		t.Fatalf("forget: %v", err)
+	}
+	if got := manage.TunnelsOnNode("kharej-de"); len(got) != 0 {
+		t.Errorf("removing the server left %v behind", got)
+	}
+	if _, ok := manage.NodeFor("nl-ws"); !ok {
+		t.Error("removing one server forgot another server's tunnel")
+	}
+
+	manage.ForgetNodePair("nl-ws")
+	if _, ok := manage.NodeFor("nl-ws"); ok {
+		t.Error("a deleted tunnel is still paired")
+	}
+}
+
+// The picker and the setup-link box both apply to a reverse tunnel and a direct
+// one, so neither may sit inside the half of the form that only reverse sees.
+//
+// This is a guard rather than a style note. Both of them did sit there, and
+// nothing failed: the form rendered, the tests passed, and the feature was
+// simply absent for every direct tunnel — which is half of what this project
+// builds. A rule about where two ids live is cheap; discovering this from a bug
+// report is not.
+func TestTheNodePickerReachesBothKindsOfTunnel(t *testing.T) {
+	loadPanel()
+
+	raw, err := fs.ReadFile(panelRoot, "views/add.html")
+	if err != nil {
+		t.Fatalf("reading add.html: %v", err)
+	}
+	html := string(raw)
+
+	// The box that pasted a setup link from a second panel used to be checked
+	// beside this one. It is gone: the panel writes the far end itself, so
+	// there is no second panel and nothing to paste.
+	if strings.Contains(html, `id="apaste"`) {
+		t.Error("add.html still has the paste-a-setup-link box, which is the two-pass " +
+			"flow the fleet exists to remove")
+	}
+
+	rev := strings.Index(html, `<div class="step3rev">`)
+	if rev < 0 {
+		t.Fatal("add.html has no .step3rev — this guard needs updating")
+	}
+	at := strings.Index(html, `id="nodeGrp"`)
+	if at < 0 {
+		t.Fatal(`id="nodeGrp" is not in add.html any more, so there is no way to pick ` +
+			"the server the far end is written on")
+	}
+	if at > rev {
+		t.Error(`id="nodeGrp" sits inside .step3rev, so it is hidden for every direct ` +
+			"tunnel — move it above the reverse/direct split")
+	}
+}
+
+// The line the panel hands out has to be a line the installer understands.
+//
+// These are two files in two languages that never call each other, and the only
+// place they meet is a server the operator has just pasted into. A flag renamed
+// on one side fails there, minutes into an install, with an error nobody here
+// would ever see. So they are pinned against each other instead.
+// A server is added and managed without anything being run on it.
+//
+// This is the change the whole batch is for. What used to be here checked that
+// the panel handed out a setup command, that install.sh understood it, and that
+// the binary had the subcommand it ended in — three things that all had to
+// agree, and one line for the operator to carry to another machine.
+//
+// There is no line now. What has to hold instead is that the far side needs no
+// state of its own: one command, which the panel runs itself.
+func TestTheFarSideNeedsNothingButTheOneCommand(t *testing.T) {
+	cli, err := os.ReadFile(filepath.Join("..", "..", "nodecmd.go"))
+	if err != nil {
+		t.Fatalf("reading nodecmd.go: %v", err)
+	}
+	src := string(cli)
+	if !strings.Contains(src, `case "exec":`) {
+		t.Fatal("`backpack node exec` is gone, and it is the only thing the panel runs " +
+			"on a managed server")
+	}
+	for _, gone := range []string{`case "setup":`, `case "run":`, `case "remove":`} {
+		if strings.Contains(src, gone) {
+			t.Errorf("nodecmd.go still has %s — the far server keeps no state now, so "+
+				"anything that sets it up or tears it down is a second model of the "+
+				"same thing", gone)
+		}
+	}
+
+	sh, err := os.ReadFile(filepath.Join("..", "..", "install.sh"))
+	if err != nil {
+		t.Fatalf("reading install.sh: %v", err)
+	}
+	if strings.Contains(string(sh), "node setup") {
+		t.Error("install.sh still ends in `backpack node setup`, which no longer exists")
+	}
+	// And it must still install without a terminal, because that is how the
+	// panel runs it on a server that has no Backpack yet.
+	if !strings.Contains(string(sh), "if [ -t 0 ]") {
+		t.Error("install.sh no longer checks for a terminal, so a remote install would " +
+			"open a menu nobody can answer")
+	}
+}
+
+func TestStartStopAndRestartReachTheOtherEnd(t *testing.T) {
+	isolateFleet(t)
+	s := newFleetServer()
+
+	if err := manage.NoteNodePair("fr-relay", "kharej-de", "fr-relay-kharej"); err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	for _, action := range []string{"start", "stop", "restart"} {
+		out := s.alsoOnNode("fr-relay", action)
+		if out["status"] != "partial" {
+			t.Errorf("%s: an action that never reached the node reported %v", action, out["status"])
+		}
+		if out["node"] != "kharej-de" {
+			t.Errorf("%s: the reply does not name the server: %v", action, out["node"])
+		}
+		if v, _ := out["peerError"].(string); !strings.Contains(v, "kharej-de") {
+			t.Errorf("%s: %q does not say which end is behind", action, v)
+		}
+	}
+
+	// Deleting is deliberately not one of them: there is no operation that
+	// removes a tunnel on a node, and a delete here is not consent to one there.
+	if out := s.alsoOnNode("fr-relay", "delete"); out["status"] != "ok" || out["node"] != nil {
+		t.Errorf("delete reached across: %v", out)
+	}
+	// And an unpaired tunnel is the ordinary case, unchanged.
+	if out := s.alsoOnNode("some-other", "restart"); out["status"] != "ok" || out["node"] != nil {
+		t.Errorf("an unpaired restart was reported as %v", out)
+	}
+}
+
+// The far end's own name is remembered, because every operation that reaches
+// across has to name it and it is not the same name as this end's.
+func TestThePeerNameIsRemembered(t *testing.T) {
+	isolateFleet(t)
+	manage.NoteNodePair("fr-relay", "kharej-de", "fr-relay-kharej")
+	p, ok := manage.PairFor("fr-relay")
+	if !ok || p.Node != "kharej-de" || p.PeerName != "fr-relay-kharej" {
+		t.Fatalf("PairFor = %+v, ok=%v", p, ok)
+	}
+	if _, ok := manage.PairFor("nothing"); ok {
+		t.Error("an unpaired tunnel reported a pair")
+	}
+}
+
+// An edit rebuilds the far end, so it first asks the far end what it already
+// has. A node that cannot answer must not turn that into a failed edit: the
+// carry-forward is an improvement on the rebuild, not a precondition for it.
+func TestTheCarryForwardNeverBlocksAnEdit(t *testing.T) {
+	isolateFleet(t)
+	s := newFleetServer()
+
+	if got := peerConnOnNode(s.nodes.Runner(), "kharej-de", "fr-relay-kharej"); got != nil {
+		t.Errorf("an unreachable node produced settings out of nowhere: %+v", got)
+	}
+}
+
+// installingRunner is a fake that starts out too old to answer and is fixed by
+// the install, which is what a real server in an existing fleet does.
+type installingRunner struct {
+	*fakeRunner
+	installed int
+	// installWorks is whether the install actually brings the server up to a
+	// version this panel can talk to. A published release that is still the old
+	// one leaves it exactly where it was.
+	installWorks bool
+}
+
+func (r *installingRunner) Install(name string) (string, error) {
+	r.installed++
+	if r.installWorks {
+		r.up[name] = true
+	}
+	return "installed", nil
+}
+
+func (r *installingRunner) Call(name, op string, body, out any) error {
+	r.calls = append(r.calls, name+":"+op)
+	if !r.up[name] {
+		return node.ErrOffline{
+			Name: name,
+			Why:  "the Backpack on that server is too old to be managed from this panel",
+			Err:  node.ErrNeedsInstall,
+		}
+	}
+	if v, ok := r.answers[op]; ok && out != nil {
+		b, _ := json.Marshal(v)
+		return json.Unmarshal(b, out)
+	}
+	return nil
+}
+
+// A server already running an older Backpack is upgraded, not refused.
+//
+// This is the bug report: the panel reached a server in the operator's fleet,
+// found a Backpack that did not understand `node exec`, and treated it as a
+// server that could not be reached — refusing the add and printing the far
+// machine's own help, which told them to run `backpack node setup`, a command
+// this release removed. Every server in an existing fleet is in that state the
+// day the panel is upgraded, so this is the ordinary path, not an edge.
+func TestAServerRunningAnOlderBackpackIsUpgradedNotRefused(t *testing.T) {
+	isolateFleet(t)
+	s := newFleetServer()
+	t.Cleanup(s.nodes.Stop)
+
+	r := &installingRunner{fakeRunner: newFake(), installWorks: true}
+	r.answers[node.OpHello] = node.Info{Version: "v1.7.7", OS: "Ubuntu 24.04"}
+	s.nodes.Use(r)
+
+	w := post(t, s, "action=add&name=germany&host=91.107.245.145&user=root&password=x")
+	if w.Code != http.StatusOK {
+		t.Fatalf("a server running an older Backpack was refused: %d %s", w.Code, w.Body.String())
+	}
+	if r.installed != 1 {
+		t.Errorf("the panel installed %d times, want once — an out-of-date server "+
+			"has to be brought up to this release over the same connection", r.installed)
+	}
+	got := node.List()
+	if len(got) != 1 {
+		t.Fatalf("the fleet holds %d servers after a successful add", len(got))
+	}
+	if got[0].Info.Version != "v1.7.7" {
+		t.Errorf("the upgraded version was not recorded: %+v", got[0].Info)
+	}
+}
+
+// And when the install does not help, the operator is told that plainly rather
+// than being handed the far machine's output.
+//
+// This is the real shape of it on the day of a release: install.sh fetches the
+// latest published release, so until this version is published the install
+// succeeds and changes nothing. Failing is correct; failing at length in
+// somebody else's words is not.
+func TestAnUpgradeThatDoesNotHelpSaysSoInOneSentence(t *testing.T) {
+	isolateFleet(t)
+	s := newFleetServer()
+	t.Cleanup(s.nodes.Stop)
+
+	r := &installingRunner{fakeRunner: newFake(), installWorks: false}
+	s.nodes.Use(r)
+
+	w := post(t, s, "action=add&name=germany&host=91.107.245.145&user=root&password=x")
+	if w.Code == http.StatusOK {
+		t.Fatal("a server that still cannot answer was added anyway")
+	}
+	if len(node.List()) != 0 {
+		t.Errorf("a server that never answered was left in the fleet: %+v", node.List())
+	}
+
+	said := w.Body.String()
+	for _, leaked := range []string{"node setup", "--setup-key", "Nodes → Add server"} {
+		if strings.Contains(said, leaked) {
+			t.Errorf("the operator is being told to use a flow that no longer exists (%q):\n%s",
+				leaked, said)
+		}
+	}
+	if lines := strings.Count(strings.TrimSpace(said), "\n"); lines > 1 {
+		t.Errorf("the failure is %d lines long:\n%s", lines+1, said)
+	}
+}
+
+// The fleet page keeps a server's own account of itself current.
+//
+// What a managed server says about itself — its version, its uptime, and now
+// its processor and memory — was written down when it was added and rewritten
+// only when somebody upgraded or refreshed it by hand. Half of that is a
+// reading rather than a fact: a card showing 4% processor from an hour ago,
+// labelled as now, is worse than one showing nothing.
+func TestTheFleetPageRefreshesWhatEachServerReports(t *testing.T) {
+	isolateFleet(t)
+	s := newFleetServer()
+	t.Cleanup(s.nodes.Stop)
+
+	f := newFake()
+	f.up["germany"] = true
+	f.answers[node.OpHello] = node.Info{Version: "v1.7.7.5", CPUPercent: 41, MemPercent: 62}
+	withFleet(s, f)
+
+	if w := post(t, s, "action=add&name=germany&host=203.0.113.9&user=root&password=x"); w.Code != http.StatusOK {
+		t.Fatalf("add: %d %s", w.Code, w.Body.String())
+	}
+
+	// Fresh: the add just asked, so a listing straight afterwards must not ask
+	// again — a page that re-read every card on every poll would put a round
+	// trip per server into every few seconds.
+	before := countCalls(f, "germany:"+node.OpHello)
+	if w := getNodes(t, s); w.Code != http.StatusOK {
+		t.Fatalf("list: %d", w.Code)
+	}
+	if got := countCalls(f, "germany:"+node.OpHello); got != before {
+		t.Errorf("a listing right after the add asked the server again (%d → %d)", before, got)
+	}
+
+	// Stale: age the record past the window and it has to ask.
+	agePastInfoTTL(t, "germany")
+	if w := getNodes(t, s); w.Code != http.StatusOK {
+		t.Fatalf("list: %d", w.Code)
+	}
+	if got := countCalls(f, "germany:"+node.OpHello); got <= before {
+		t.Error("a stale record was served as current — the card would show a " +
+			"processor reading from whenever the server was added")
+	}
+}
+
+func getNodes(t *testing.T, s *server) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	s.handleNodes(w, httptest.NewRequest("GET", "/api/nodes", nil))
+	return w
+}
+
+func countCalls(f *fakeRunner, want string) int {
+	n := 0
+	for _, c := range f.calls {
+		if c == want {
+			n++
+		}
+	}
+	return n
+}
+
+// agePastInfoTTL rewinds when a server last reported, so the next listing
+// treats what is stored as old.
+func agePastInfoTTL(t *testing.T, name string) {
+	t.Helper()
+	raw, err := os.ReadFile(node.StorePath)
+	if err != nil {
+		t.Fatalf("reading the fleet: %v", err)
+	}
+	var store struct {
+		Nodes []map[string]any `json:"nodes"`
+	}
+	if err := json.Unmarshal(raw, &store); err != nil {
+		t.Fatalf("fleet file: %v", err)
+	}
+	for _, n := range store.Nodes {
+		if s, _ := n["name"].(string); strings.EqualFold(s, name) {
+			n["lastSeen"] = time.Now().Add(-time.Hour).Unix()
+		}
+	}
+	out, _ := json.Marshal(store)
+	if err := os.WriteFile(node.StorePath, out, 0600); err != nil {
+		t.Fatalf("writing the fleet: %v", err)
+	}
+}

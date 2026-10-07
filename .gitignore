@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+controller/config.json
+controller/state.json
+*.env
+
+bin/batmantunnel-engine

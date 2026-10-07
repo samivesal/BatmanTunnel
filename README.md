@@ -1,2 +1,156 @@
 # BatmanTunnel
-Adaptive paired tunnel manager built on BackPack, with automatic route selection, TCP/UDP forwarding and an English black-and-green dashboard.
+
+**One paired tunnel manager. Native BackPack transports. Automatic measured route selection.**
+
+Based on BackPack by Amin Mohammadi (AminMGMT)
+https://github.com/AminMGMT/BackPack
+
+BatmanTunnel 0.2.0 adds a paired supervisor, an English terminal wizard, a fixed TCP/UDP entrypoint and a black/neon-green dashboard to the included BackPack v1.8.5 native engine. It provisions both sides of each candidate itself. No manually prepared alternative tunnels or external echo server are required.
+
+**Release status: experimental, locally integration-tested.** Native forwarding, paired coordination, route switching and rollback have local automated tests. Real Iran–abroad performance, direct/raw carriers on a real network and multi-day reliability have not been verified. No software can guarantee connectivity when every compatible path is blocked.
+
+## Install on both servers
+
+Use two Linux servers with systemd, Python 3.10+, OpenSSL, iproute2 and root access. Ubuntu 22.04/24.04 and Debian 12 satisfy the Python requirement; this release has not been installed on every listed distribution. amd64 and arm64 Linux binaries are included in the complete bundle. Allow at least 2 GB RAM per node while the initial comparison runs. Direct carriers require `/dev/net/tun` and network administration privileges; raw carriers require the relevant provider permissions.
+
+Transfer `batmantunnel.tar.gz` to each server, then:
+
+```bash
+tar -xzf batmantunnel.tar.gz
+cd BatmanTunnel
+sudo bash install.sh
+sudo batmantunnel
+```
+
+Dependencies, if missing on Debian/Ubuntu:
+
+```bash
+sudo apt-get update && sudo apt-get install -y python3 openssl iproute2 ca-certificates curl
+```
+
+The installer preserves an existing pair and saves the previous code under `/opt/batmantunnel.previous.TIMESTAMP`. It does not change your default route, disable your firewall, or install an unattended upstream updater. The included native raw carriers can manage their narrow protocol-specific firewall rules as implemented upstream.
+
+### One-line GitHub installation
+
+Run on **both Linux servers** (root/sudo, Python 3.10+, OpenSSL, iproute2 and curl):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/samivesal/BatmanTunnel/main/install.sh -o /tmp/batmantunnel-install.sh && sudo bash /tmp/batmantunnel-install.sh && sudo batmantunnel
+```
+
+The installer downloads release `v0.2.0`, verifies its SHA-256 checksum, and installs the native binary matching amd64 or arm64. No Go compiler is required for the complete release. Run Setup Iran first, then paste its pairing link into Setup Abroad.
+
+[Download release](https://github.com/samivesal/BatmanTunnel/releases/tag/v0.2.0) · [Source](https://github.com/samivesal/BatmanTunnel)
+
+## Pair the servers
+
+1. On the Iran server, run `batmantunnel`, choose **Setup Iran**, and enter both public IPv4 addresses.
+2. Enter the public Iran service port and the service address on the abroad server, such as `127.0.0.1:443`. Choose `tcp`, `udp`, or `both`. Add up to eight service mappings.
+3. The wizard generates the native configurations and a secret `batman://2...` pairing link.
+4. On the abroad server, choose **Setup Abroad** and paste the link. The input is hidden.
+5. Once both nodes connect, BatmanTunnel tests the candidates for 180 seconds, allowing up to 45 seconds for startup. Normally the first selection takes approximately 3–5 minutes.
+
+Keep the pairing link private: it contains the shared credentials and TLS identity. It is also stored at `/etc/batmantunnel/pair.link` on the Iran node. Configuration and keys are root-only. To replace a pair, repeat setup on both nodes; the wizard asks for `REPLACE` before stopping an existing configuration. Pairing currently supports IPv4 addresses, not hostnames or IPv6 endpoints.
+
+## Native transport coverage
+
+| Family | Included transports | Service traffic |
+| --- | --- | --- |
+| Reverse | TCP, TCPMUX, STEALTH, PCK, KCP, QUIC, WS, WSMUX, WSS, WSSMUX, XDI | TCP and UDP forwarding |
+| Reverse | UDP | UDP only; excluded from selection when any mapping needs TCP |
+| Direct L3 | UDP, QUIC, PCK, XDI, SNI, SPOOF | TCP and UDP over the native L3 engine |
+
+All 18 configurations use the native BackPack renderers and are checked by the native binary before setup completes. Disabled and incompatible candidates remain visible in the panel. SPOOF is disabled until both source addresses are explicitly configured in advanced setup; provider support is required. Direct carriers are unavailable without a TUN device. These are transport families, not every upstream tuning preset or spoof profile: BatmanTunnel uses the balance preset, GRE encapsulation, MTU 1280, and the UDP spoof profile.
+
+## Selection and recovery
+
+- Probes pass through each real tunnel to a private authenticated responder on the abroad node. Both requests and replies use HMAC authentication.
+- A candidate needs at least 98% successful probe rounds and successful final rounds in its measurement window. TCP/UDP requirements follow your service mappings.
+- The score weights current delivery (55%), recent delivery (25%), retained history (10%), latency (7%) and jitter (3%). The short transfer sample is diagnostic, not a sustained bandwidth benchmark.
+- Full comparisons run every **3 hours** by default. The active path continues to carry users while alternatives are tested.
+- The active route is checked every **60 seconds**. **3 consecutive failures** trigger recovery through a verified standby or a fresh, shortened emergency comparison.
+- Normal switching requires a **10-point advantage** and a **30-minute cooldown**. Emergency switching bypasses the advantage/cooldown, but still verifies the candidate and peer readiness.
+- The Iran node coordinates monotonic desired-route revisions over certificate-pinned HTTPS. Control can use the public peer link or a working tunnel. The destination engine must be running on the peer before activation.
+- Before and after changing the entrypoint target, fresh authenticated tunnel probes must pass. A failed post-switch probe restores the old route if it still verifies.
+- After comparison, the active route and one standby remain running. Retired routes receive a **10-minute drain window** before their engines stop. Existing TCP sessions keep their original route during this window. UDP flows use the new route after generation change. Switching is not a promise of zero lost packets or unlimited preservation of old sessions.
+- If automatic switching is disabled after a route is selected, comparisons continue but do not change the selected route, including during failures.
+- History retains up to 720 results per route within seven days. A restart re-verifies routes instead of trusting stale measurements.
+
+The probes verify tunnel transport to the built-in responder. They do not verify your application's login, HTTP response, TLS certificate, database or business health. Keep application monitoring alongside the tunnel. If no compatible tunnel works, the panel reports failure; the software cannot create an unavailable network path.
+
+## Ports and network prerequisites
+
+Defaults can be changed in advanced setup before pairing. Allow traffic only where your network design needs it; no broad firewall reset is necessary.
+
+| Purpose | Default | Exposure |
+| --- | --- | --- |
+| Pair control, certificate-pinned HTTPS | TCP 9443 | Both peer public IPs; restrict to the other server where feasible |
+| Reverse carriers | 23000–23011 | Iran node, carrier-dependent TCP/UDP/raw IP |
+| Direct carriers | 23012–23017 | Abroad node, carrier-dependent TCP/UDP/raw IP |
+| Fixed user service | Your chosen mapping | Iran node, selected TCP/UDP |
+| Candidate service / probe / control ports | 32000–32287 | Iran loopback only |
+| Authenticated responder | TCP/UDP 19001 | Abroad loopback and direct private interfaces |
+| Direct service relays | 19100–19107 | Abroad private interfaces |
+| Web dashboard | TCP 8787 | Loopback only; access via SSH |
+
+Raw PCK/XDI/SPOOF methods may require additional IP protocol permissions and upstream firewall handling; TCP/UDP port rules alone are insufficient. Direct TUN routes use a generated private `/24` with one `/30` per carrier. Inspect that subnet in `node.json` for conflicts with your existing private networks. Cloud security groups, NAT and provider restrictions can prevent a candidate from working even if its native configuration is valid. TLS on the peer control channel does not change the security properties of each native data transport.
+
+## Terminal commands
+
+```bash
+sudo batmantunnel                 # Interactive menu
+sudo batmantunnel setup-iran
+sudo batmantunnel setup-abroad
+sudo batmantunnel status
+sudo batmantunnel test
+sudo batmantunnel policy --interval 3 --auto on
+sudo batmantunnel policy --auto off
+sudo batmantunnel panel            # SSH instruction + admin key
+sudo batmantunnel pair-link        # Secret: do not post publicly
+sudo batmantunnel logs
+sudo batmantunnel restart
+sudo batmantunnel stop
+```
+
+## Dashboard
+
+Run the command printed by `batmantunnel panel` on your own computer:
+
+```bash
+ssh -L 8787:127.0.0.1:8787 root@YOUR_SERVER_IP
+```
+
+Open `http://127.0.0.1:8787` and enter the admin key. Overview, Routes, Settings, Events and Installation are fully English. The token remains in page memory; it is not stored in browser local storage. Policy edits and comparisons are controlled by the Iran node. The abroad panel reports its local engine state and the Iran node's selected route.
+
+The hosted BatmanTunnel site is the interface preview and download/guide page. It is not a cloud tunnel endpoint and cannot operate your servers without a server-side deployment. Live administration happens through the SSH-forwarded local panel.
+
+## Files, logs and recovery
+
+- `/opt/batmantunnel/`: application, native engine and corresponding source.
+- `/etc/batmantunnel/node.json`: role, pair credentials, settings and panel admin key.
+- `/etc/batmantunnel/runtime.json`: route history and revision state.
+- `/etc/batmantunnel/engines/`: generated native TOML files and bounded per-route logs.
+- `/etc/batmantunnel/relay.log`: fixed-entrypoint diagnostics.
+- `journalctl -u batmantunnel -n 100`: supervisor startup/errors.
+
+If a server cannot join, check peer IPs, carrier firewall rules, TCP 9443, system time and the service journal. If a route is marked unavailable, inspect its reason and native log. If the entrypoint is listening but your application fails, verify the configured abroad backend locally. The native engine restarts after failures with backoff; systemd restarts the supervisor after crashes.
+
+Optional Telegram event alerts use `/etc/batmantunnel/notifications.env` with `BATMAN_TELEGRAM_TOKEN` and `BATMAN_TELEGRAM_CHAT_ID`. Set mode 600 and restart the service. Alerts contain route events only. No messaging account is configured by the installer.
+
+To roll back a code upgrade, stop the service, restore the previous application directory, and restart. Keep the paired configuration. To remove the service, stop and disable `batmantunnel`, then remove its systemd unit and `/usr/local/bin/batmantunnel`; remove `/opt/batmantunnel` and `/etc/batmantunnel` only when you intend to delete the software and pair secrets.
+
+## Build and tests
+
+```bash
+# Go 1.26.6+, Linux
+bash scripts/build-engine.sh
+python3 -m unittest discover -s tests -v
+```
+
+Local tests cover configuration rendering for all 18 methods on both roles, bounded pairing decode, authenticated probes, pinned HTTPS, panel authorization, compatible selection, hysteresis, peer revision handling, post-switch rollback, fixed-port TCP/UDP forwarding, preservation of an existing TCP session, actual transfers through 10 reverse transports, and a two-node TCP-to-QUIC switch. Direct/raw transports need separate privileged two-server validation. ARM64 is cross-compiled here, not executed on ARM hardware.
+
+The GitHub release workflow builds both architectures and packages source plus binaries. Its actions run only after you publish the repository and a version tag; that workflow has not been run on GitHub in this workspace.
+
+## License and attribution
+
+GNU AGPL-3.0. The full corresponding native source and BatmanTunnel additions are included. The local panel provides a source download. Retain the attribution above, `NOTICE`, upstream notices and third-party licenses. The bundled BackPack source is pinned in `engine/UPSTREAM_COMMIT`; BatmanTunnel changes are in `engine/batman.go`, `engine/batman_relay.go`, the main command dispatch and native application paths. Upstream historical documentation is preserved as third-party source; BatmanTunnel's own interface and guide are English.

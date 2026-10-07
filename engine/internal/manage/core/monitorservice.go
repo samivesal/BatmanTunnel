@@ -1,0 +1,132 @@
+package core
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/backpack/backpack/internal/app"
+)
+
+// The monitor service.
+//
+// Watching the tunnels, running the Telegram bot and sending alerts used to
+// happen inside the web-panel process. That made the panel a dependency of
+// monitoring, which is backwards: stopping the panel — or the panel crashing,
+// or the user turning it off because they only wanted the CLI — silently
+// stopped the watchdog restarting dropped tunnels and stopped every alert. The
+// failure was invisible, which is the worst property a monitor can have.
+//
+// It now runs as its own systemd unit that depends on nothing but the machine
+// being up. This file only manages the unit; the work itself lives in
+// internal/monitor, which imports this package.
+
+// monitorUnit is the systemd unit for the monitor service.
+const monitorUnit = `[Unit]
+Description=Backpack Monitor (watchdog, Telegram bot and alerts)
+After=network.target
+# A crash loop has to end somewhere visible.
+#
+# Restart=always on its own never lets this unit reach "failed": it restarts for
+# ever, so systemctl status says "activating" a few seconds out of every ten and
+# an operator glancing at it sees a service that is running. With a start limit,
+# a monitor that cannot stay up stops trying and says so — and the heartbeat in
+# the config directory goes stale, which is what Diagnose and the panel read.
+#
+# Six attempts in five minutes is well past any transient cause. These belong in
+# [Unit] and not [Service]: systemd moved them, and the old placement is ignored
+# without a word on any version that matters.
+StartLimitIntervalSec=300
+StartLimitBurst=6
+
+[Service]
+# notify rather than simple, so systemd knows the difference between a process
+# that exists and one that is working.
+#
+# This unit is the right place for a watchdog and a tunnel engine is not. What
+# it catches is a monitor wedged on a job that never returns — a goroutine
+# deadlocked, a socket that will never answer — which systemd is otherwise
+# perfectly happy with, and which looks from the outside exactly like a healthy
+# service with nothing to do. The cost of being wrong is a restart of the
+# watchdog; the cost of not noticing is a fleet with nothing watching it.
+#
+# WatchdogSec is generous on purpose: the heartbeat goes out every half of it,
+# and a machine under load must not be killed for being slow.
+Type=notify
+NotifyAccess=main
+WatchdogSec=120
+ExecStart=%s --monitor
+Restart=always
+RestartSec=5
+# The tunnel units carry this too. A service does not inherit the ceiling in
+# /etc/security/limits.conf — that file is PAM's, and applies to login sessions
+# — so a unit that does not ask gets systemd's default of 1024, and no amount
+# of running Optimize or rebooting changes it. This process holds the panel's
+# own sockets, the node hub's listeners and whatever it proxies, so it needs
+# the same headroom the tunnels were given.
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+`
+
+// EnsureMonitorService installs and starts the monitor unit. It is idempotent,
+// so it is safe to call on every menu launch and after every update — which is
+// also how an install that predates the service acquires it.
+func EnsureMonitorService() error {
+	changed, err := writeMonitorUnitIfChanged()
+	if err != nil {
+		return err
+	}
+	if IsActive(app.MonitorService) {
+		if !changed {
+			return nil
+		}
+		// A rewritten unit has to be restarted, not started: `systemctl start`
+		// is a no-op on a service that is already active, which would leave the
+		// old definition running while the file on disk says something else.
+		return RestartService(app.MonitorService)
+	}
+	return StartService(app.MonitorService)
+}
+
+// writeMonitorUnitIfChanged brings the unit file up to date, reloading systemd
+// when it changed, and touches no running process. Only a changed unit touches
+// systemd, so a normal launch does not churn the daemon or bounce a healthy
+// monitor.
+func writeMonitorUnitIfChanged() (bool, error) {
+	path := app.ServiceDir + "/" + app.MonitorService
+	want := fmt.Sprintf(monitorUnit, app.BinPath)
+	if current, err := os.ReadFile(path); err == nil && string(current) == want {
+		return false, nil
+	}
+	if err := os.WriteFile(path, []byte(want), 0644); err != nil {
+		return false, err
+	}
+	return true, DaemonReload()
+}
+
+// RestartMonitorService installs the unit if needed and always restarts the
+// process.
+//
+// Used after an update. EnsureMonitorService alone is not enough there: the
+// unit text does not change when only the binary is replaced, so it would
+// correctly decide there is nothing to do — and the monitor would go on running
+// the previous version's code until the machine rebooted.
+func RestartMonitorService() error {
+	if err := EnsureMonitorService(); err != nil {
+		return err
+	}
+	return RestartService(app.MonitorService)
+}
+
+// DisableMonitorService stops and removes the monitor unit.
+func DisableMonitorService() error {
+	if IsActive(app.MonitorService) || IsEnabled(app.MonitorService) {
+		DisableService(app.MonitorService)
+	}
+	os.Remove(app.ServiceDir + "/" + app.MonitorService)
+	return DaemonReload()
+}
+
+// MonitorRunning reports whether the monitor service is active.
+func MonitorRunning() bool { return IsActive(app.MonitorService) }

@@ -1,0 +1,11 @@
+BatmanTunnel 0.2.0
+
+Based on BackPack by Amin Mohammadi (AminMGMT)
+https://github.com/AminMGMT/BackPack
+
+Native engine source: BackPack v1.8.5, commit ff86354 (full commit recorded in engine/UPSTREAM_COMMIT).
+BatmanTunnel modifies engine paths and adds native configuration rendering and a TCP/UDP entrypoint relay.
+The paired Python supervisor, terminal workflow, installer and BatmanTunnel panel are additions.
+Distributed under GNU AGPL version 3; preserve upstream copyright and attribution notices.
+See engine/LICENSE, engine/NOTICE and engine/THIRD_PARTY_LICENSES for upstream legal information where present.
+Fonts retain their included SIL Open Font License notices in dist/fonts/.

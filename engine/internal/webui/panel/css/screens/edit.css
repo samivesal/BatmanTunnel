@@ -1,0 +1,69 @@
+/* edit — everything this screen needs, ported from editdlg.html.
+ * Self-contained on purpose: injected when the screen opens and removed
+ * when it closes, so two screens can never fight over a rule.
+ */
+
+body[data-t="dark"]{background:#070707;color:#fafafa;
+    --bg:#070707;--s1:#111111;--s2:#181818;--s3:#1f1f1f;
+    --ln:rgba(255,255,255,.08);--ln2:rgba(255,255,255,.15);--ln3:rgba(255,255,255,.3);
+    --tx:#fafafa;--tx2:#dcdcdc;--mu:#8e8e8e;--dim:#606060;--faint:#3d3d3d;
+    --sunk:rgba(255,255,255,.05);--field:#0c0c0c;
+    --lift:0 22px 50px -24px rgba(0,0,0,.95);--spark:#e8e8e8}
+body[data-t="light"]{background:#f2f2f2;color:#0a0a0a;
+    --bg:#f2f2f2;--s1:#ffffff;--s2:#fafafa;--s3:#f4f4f4;
+    --ln:rgba(0,0,0,.09);--ln2:rgba(0,0,0,.16);--ln3:rgba(0,0,0,.34);
+    --tx:#0a0a0a;--tx2:#2e2e2e;--mu:#6b6b6b;--dim:#949494;--faint:#c4c4c4;
+    --sunk:rgba(0,0,0,.045);--field:#ffffff;
+    --lift:0 22px 46px -26px rgba(0,0,0,.32);--spark:#1a1a1a}
+@media (max-width:780px){.cell.open{grid-column:span 1}}
+.c7{background:var(--s1);border:1px solid var(--ln);border-radius:18px;position:relative;overflow:hidden;
+    display:flex;flex-direction:column;min-height:318px;transition:border-color .3s var(--spring)}
+.c7 .hd,.ed .eh{display:flex;align-items:center;gap:10px}
+.fl{width:30px;height:30px;border-radius:9px;background:var(--s3);border:1px solid var(--ln);
+    display:grid;place-items:center;font-size:15px;flex:none}
+.c7 .id b{display:block;font-size:14.5px;font-weight:640;letter-spacing:-.022em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.c7 .id small{display:block;font-size:11px;color:var(--dim);margin-top:1px}
+.dot{width:7px;height:7px;border-radius:50%;flex:none;display:block;background:var(--ok);animation:bp 2.6s ease-out infinite}
+@keyframes bp{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--ok) 45%,transparent)}70%{box-shadow:0 0 0 9px transparent}100%{box-shadow:0 0 0 0 transparent}}
+.c7 .kind span{font-size:10.5px;font-weight:620;letter-spacing:.04em;text-transform:uppercase;padding:3px 8px;border-radius:6px;background:var(--sunk);color:var(--mu)}
+.c7 .kind span.q{background:transparent;border:1px solid var(--ln);color:var(--dim);text-transform:none;letter-spacing:0;font-weight:560}
+.relay{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;font-weight:620;padding:5px 9px 5px 7px;
+  border-radius:8px;background:var(--sunk);border:1px solid var(--ln);color:var(--tx2)}
+.relay svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+
+/* The switches and menus were drawn as divs and are controls now.
+ *
+ * The .sww face already existed in the preview; what it never had was a state
+ * that meant anything. .selmenu is new — the list a .sel opens, positioned
+ * against the control so it travels with the drawer it sits in.
+ */
+.dlg .sww{cursor:pointer}
+.dlg .sel{position:relative;cursor:pointer}
+.dlg .sel.open{border-color:var(--ln3)}
+.dlg .selmenu{position:absolute;left:0;right:0;top:calc(100% + 5px);z-index:30;
+  display:grid;gap:1px;padding:4px;border-radius:11px;border:1px solid var(--ln2);
+  background:var(--s1);box-shadow:var(--lift);max-height:220px;overflow-y:auto}
+.dlg .selopt{font:inherit;text-align:left;font-size:12.5px;padding:8px 10px;border:0;
+  border-radius:8px;background:transparent;color:var(--tx2);cursor:pointer;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  transition:background .16s ease,color .16s ease}
+.dlg .selopt:hover{background:var(--sunk);color:var(--tx)}
+
+/* A phone: the tabs scroll sideways as one row instead of wrapping their
+   labels in two ("Fine-/tune") and pushing History off the edge. */
+@media (max-width:560px){
+  .dlg .tabs{overflow-x:auto;scrollbar-width:none;flex-wrap:nowrap}
+  .dlg .tabs::-webkit-scrollbar{display:none}
+  .dlg .tabs button{white-space:nowrap;flex:none}
+}
+
+/* After an edit the kharej has to follow: the one line that does it. */
+.dlg .ed-hand{display:flex;flex-direction:column;gap:14px;padding:18px;animation:edh-in .45s cubic-bezier(.32,.72,0,1) both}
+@keyframes edh-in{from{opacity:0;transform:translateY(8px)}}
+.dlg .ed-hand-h{display:flex;gap:12px;align-items:flex-start}
+.dlg .ed-hand-h b{display:block;font-size:14px;font-weight:650;letter-spacing:-.02em}
+.dlg .ed-hand-h small{display:block;font-size:12px;color:var(--dim);line-height:1.55;margin-top:3px}
+.dlg .ed-ok{width:30px;height:30px;border-radius:50%;flex:none;position:relative;
+  background:color-mix(in srgb,var(--ok) 15%,transparent);border:1px solid color-mix(in srgb,var(--ok) 35%,transparent)}
+.dlg .ed-ok::after{content:"";position:absolute;left:10px;top:7px;width:6px;height:11px;border:solid var(--ok);
+  border-width:0 2px 2px 0;transform:rotate(45deg)}

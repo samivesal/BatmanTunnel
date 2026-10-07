@@ -1,0 +1,539 @@
+// Package metrics records what a running tunnel is actually doing — how much
+// it carried, how much had to be sent twice, and how much was repaired by
+// error correction — and leaves a snapshot on disk for the CLI to read.
+//
+// A tunnel runs as its own process, so there is no shared memory to inspect.
+// Each engine writes a small JSON file that the menu reads, which keeps the
+// two sides decoupled and costs nothing when nobody is looking.
+package metrics
+
+import (
+	"encoding/json"
+	"log"
+	"net"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"time"
+
+	"github.com/xtaci/kcp-go/v5"
+)
+
+// Snapshot is one reading of a tunnel's counters.
+type Snapshot struct {
+	Name      string    `json:"name"`
+	Transport string    `json:"transport"`
+	Role      string    `json:"role"`
+	Taken     time.Time `json:"taken"`
+	Uptime    string    `json:"uptime"`
+
+	// Traffic over the tunnel itself, as the transport sees it.
+	BytesIn  uint64 `json:"bytes_in"`
+	BytesOut uint64 `json:"bytes_out"`
+
+	// Peer is the address of the connected far end, when the transport knows it.
+	//
+	// It used to be filled in only by the datagram transports, on the reasoning
+	// that for the TCP-based ones the socket table already shows who is
+	// connected. It does not. It shows a socket — and a socket outlives the
+	// tunnel it belongs to by a long way: one whose keepalive probes are going
+	// unanswered stays ESTABLISHED for eleven minutes on the shipped defaults,
+	// and one stalled on a path that drops full-sized packets stays ESTABLISHED
+	// while it retransmits. Every failure the watchdog missed looked healthy in
+	// that table. So every transport reports its peer now, and the watchdog asks
+	// the engine rather than the kernel.
+	Peer string `json:"peer,omitempty"`
+
+	// Connected is what the engine says about its own control channel: true
+	// while it holds one, false when it does not.
+	//
+	// It is a pointer because absent has to be distinguishable from false. A
+	// tunnel still running an older binary through an upgrade writes a snapshot
+	// with no opinion here at all, and reading that as "not connected" would
+	// have the watchdog restarting every tunnel on the host. Absent means ask
+	// the socket table, as before.
+	Connected *bool `json:"connected,omitempty"`
+
+	// Runtime is what the process is holding: goroutines, descriptors and heap.
+	// A pointer so a snapshot written by an older binary through an upgrade is
+	// distinguishable from one reporting zero of everything.
+	Runtime *RuntimeStats `json:"runtime,omitempty"`
+
+	// KCP-only. Zero on every other transport.
+	KCP *KCPStats `json:"kcp,omitempty"`
+
+	// The connection pool, on the client transports that keep one. The pool is
+	// allowed to grow past PoolConfigured under load, so reporting only the
+	// live count would look like a leak; the two together, with the throughput
+	// that caused it, are what make the number explainable.
+	Pool *PoolStats `json:"pool,omitempty"`
+
+	// LocalService is the last hop, when it is failing.
+	//
+	// Everything else here describes the tunnel, and the tunnel can be
+	// perfectly healthy while carrying nothing: the client delivers each
+	// connection to the service it forwards to, and if nothing is listening
+	// there, every one of them dies one step past the end. The control channel
+	// stays up, the peer is reported, the panel shows green, and the only place
+	// the truth appears is the client's log.
+	//
+	// So the client writes it down. Absent means the last hop is working, or
+	// has not been tried.
+	LocalService *LocalServiceState `json:"local_service,omitempty"`
+}
+
+// LocalServiceState is what the client knows about the service it forwards to.
+type LocalServiceState struct {
+	// Addr is the address being dialled, so the operator is told which one.
+	Addr string `json:"addr"`
+	// Why is the shape of the failure in one word — "refused", "timeout" or
+	// "unreachable" — because the fix differs: a refusal is a service that is
+	// not there, a timeout is usually a firewall on the same machine.
+	Why string `json:"why"`
+	// Failures is how many connections have died this way since the last one
+	// that worked, and Since is when the run started.
+	Failures uint64    `json:"failures"`
+	Since    time.Time `json:"since"`
+}
+
+// PoolStats is the state of the client's connection pool.
+type PoolStats struct {
+	// Live is how many connections are open right now.
+	Live int `json:"live"`
+	// Target is the size the pool is currently aiming for, and Configured is
+	// what the operator asked for. Target above Configured means the pool grew
+	// on purpose.
+	Target     int `json:"target"`
+	Configured int `json:"configured"`
+	// Mbps is the throughput over the last interval — the signal that grows the
+	// pool, and the answer to whether it is working hard or leaking.
+	Mbps int `json:"mbps"`
+}
+
+// The connected peer, published by whichever transport is running. One tunnel
+// runs per process, so a single value needs no key.
+var peerAddr atomic.Pointer[string]
+
+// Whether a control channel is held. Nil until the engine says either way, so a
+// snapshot from a binary that predates this carries no claim at all — see
+// Snapshot.Connected.
+var (
+	connected atomic.Pointer[bool]
+	yes       = true
+	no        = false
+)
+
+// SnapshotConnected is what the next snapshot would record, or nil if this
+// engine has not said. Exported for the same reason SnapshotPeer is.
+func SnapshotConnected() *bool { return connected.Load() }
+
+// ReportPeer records the address of the connected far end, and with it that
+// there is a far end at all. Called by every transport when its control channel
+// comes up.
+func ReportPeer(addr string) {
+	peerAddr.Store(&addr)
+	connected.Store(&yes)
+}
+
+// ClearPeer forgets the connected peer, on disconnect or restart, so a stale
+// address is not reported as current.
+func ClearPeer() {
+	peerAddr.Store(nil)
+	connected.Store(&no)
+}
+
+// The last hop, published by the client transports. One tunnel runs per
+// process, so like the peer above this needs no key.
+var localService atomic.Pointer[LocalServiceState]
+
+// ReportLocalDialFailure records that a connection could not be handed to the
+// service being forwarded to. Called by the client transports, through the one
+// reporter that also logs it.
+//
+// Consecutive failures to the same address accumulate rather than replacing
+// each other: "refused 400 connections since 15:13" is a different statement
+// from "one refusal", and the difference is whether the operator is looking at
+// a service that is down or a client that tried once during a restart.
+func ReportLocalDialFailure(addr, why string) {
+	for {
+		old := localService.Load()
+		next := &LocalServiceState{Addr: addr, Why: why, Failures: 1, Since: time.Now()}
+		if old != nil && old.Addr == addr && old.Why == why {
+			next.Failures = old.Failures + 1
+			next.Since = old.Since
+		}
+		if localService.CompareAndSwap(old, next) {
+			return
+		}
+	}
+}
+
+// ReportLocalDialSuccess clears the run. The next snapshot says nothing about
+// the last hop, which is what a working one should say.
+func ReportLocalDialSuccess() {
+	if localService.Load() != nil {
+		localService.Store(nil)
+	}
+}
+
+// SnapshotLocalService is what the next snapshot would record about the last
+// hop, or nil when it is working. Exported for the same reason SnapshotPeer is.
+func SnapshotLocalService() *LocalServiceState { return localService.Load() }
+
+// SnapshotPeer is what the next snapshot would record as the peer, or "" if
+// there is none. Read-only, and exported so an engine in another package can be
+// tested against what the panel would actually show — which for a layer-3
+// tunnel is the only thing that can say whether it is up.
+func SnapshotPeer() string { return currentPeer() }
+
+// currentPeer returns the reported peer, or "" if there is none.
+func currentPeer() string {
+	if p := peerAddr.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+// KCPStats is what the KCP layer knows about the quality of the link. These
+// numbers are the honest answer to "is this transport earning its keep?".
+type KCPStats struct {
+	PacketsIn  uint64 `json:"packets_in"`
+	PacketsOut uint64 `json:"packets_out"`
+
+	// Retransmitted is how many segments had to be sent again — the cost of a
+	// lossy link that error correction could not cover.
+	Retransmitted uint64 `json:"retransmitted"`
+	// Lost is how many segments KCP concluded never arrived.
+	Lost uint64 `json:"lost"`
+	// Duplicated is how many arrived more than once.
+	Duplicated uint64 `json:"duplicated"`
+
+	// FECRecovered is the number of packets rebuilt from parity instead of
+	// being waited for. This is forward error correction doing its job, and
+	// the clearest signal that KCP is the right transport for this route.
+	FECRecovered uint64 `json:"fec_recovered"`
+	// FECErrors counts parity groups that could not be rebuilt.
+	FECErrors uint64 `json:"fec_errors"`
+}
+
+// LossPercent estimates how much of the traffic needed repair or resending.
+// It is derived from KCP's own accounting, not from a probe, so it reflects
+// the traffic the tunnel actually carried.
+func (k *KCPStats) LossPercent() float64 {
+	if k == nil || k.PacketsOut == 0 {
+		return 0
+	}
+	return float64(k.Retransmitted+k.Lost) / float64(k.PacketsOut) * 100
+}
+
+// Path returns where a tunnel's snapshot lives.
+func Path(dir, name string) string {
+	return filepath.Join(dir, name+".metrics.json")
+}
+
+// Collector periodically writes a tunnel's snapshot to disk.
+type Collector struct {
+	// baseIn/baseOut are the totals this tunnel had already accumulated before
+	// this process started, read from the last written snapshot.
+	baseIn, baseOut uint64
+	// startIn/startOut are what the byte sources already read when this
+	// collector was made. Only what they count after that is new: a reload
+	// makes a new collector in the same process, whose process-wide counters
+	// the baseline above already holds.
+	startIn, startOut uint64
+
+	dir       string
+	name      string
+	transport string
+	role      string
+	started   time.Time
+
+	// bytesIn/bytesOut are supplied by the caller, since only the transport
+	// knows what it moved.
+	bytesIn  func() uint64
+	bytesOut func() uint64
+}
+
+// NewCollector builds a collector for one tunnel. The byte accessors may be
+// nil when a transport does not track them.
+func NewCollector(dir, name, transport, role string, bytesIn, bytesOut func() uint64) *Collector {
+	c := &Collector{
+		dir:       dir,
+		name:      name,
+		transport: transport,
+		role:      role,
+		started:   time.Now(),
+		bytesIn:   bytesIn,
+		bytesOut:  bytesOut,
+	}
+	// Carry on from whatever this tunnel had already moved.
+	//
+	// The live counters only know about this process, so without a baseline the
+	// totals would reset every restart — and a tunnel restarts for all sorts of
+	// ordinary reasons: an update, a config edit, the watchdog. A figure that
+	// silently returns to zero is not a total of anything.
+	//
+	// The baseline comes from the tunnel's own metrics file, which lives in the
+	// config directory and is therefore inside every backup. So restoring a
+	// backup also restores the traffic history, rather than starting the count
+	// again on the new machine.
+	if prev, err := Read(dir, name); err == nil {
+		c.baseIn, c.baseOut = prev.BytesIn, prev.BytesOut
+	}
+	c.startIn, c.startOut = c.live()
+	return c
+}
+
+// live is what this tunnel's byte sources read now: the engine's own counters
+// when it keeps them, the process-wide ones otherwise.
+func (c *Collector) live() (in, out uint64) {
+	in, out = Traffic()
+	if c.bytesIn != nil {
+		in = c.bytesIn()
+	}
+	if c.bytesOut != nil {
+		out = c.bytesOut()
+	}
+	return in, out
+}
+
+// since is what a counter has moved from start. A source that went back —
+// an engine that rebuilt its counters — counts from zero again.
+func since(now, start uint64) uint64 {
+	if now < start {
+		return now
+	}
+	return now - start
+}
+
+// Total is everything this tunnel has carried, in and out, carried over from
+// every earlier run — the figure a traffic limit is held against. Cheaper than
+// Snapshot, which a limit checked several times a second does not need.
+func (c *Collector) Total() uint64 {
+	in, out := c.live()
+	return c.baseIn + since(in, c.startIn) + c.baseOut + since(out, c.startOut)
+}
+
+// Snapshot reads the current counters without writing anything.
+func (c *Collector) Snapshot() Snapshot {
+	s := Snapshot{
+		Name:      c.name,
+		Transport: c.transport,
+		Role:      c.role,
+		Taken:     time.Now(),
+		Uptime:    time.Since(c.started).Round(time.Second).String(),
+		Peer:      currentPeer(),
+		Connected: connected.Load(),
+	}
+	// The persisted baseline plus what has been carried since this collector
+	// took over from it.
+	liveIn, liveOut := c.live()
+	s.BytesIn = c.baseIn + since(liveIn, c.startIn)
+	s.BytesOut = c.baseOut + since(liveOut, c.startOut)
+	if live, target, configured, mbps := PoolState(); configured > 0 {
+		s.Pool = &PoolStats{Live: live, Target: target, Configured: configured, Mbps: mbps}
+	}
+	s.LocalService = localService.Load()
+	// What this process is holding. See runtime.go for why these are here and
+	// not left to a profiler nobody attaches to a production tunnel.
+	rs := readRuntimeStats()
+	s.Runtime = &rs
+	if c.transport == "kcp" {
+		// kcp-go keeps these counters process-wide. A tunnel runs as its own
+		// process, so they describe exactly this tunnel.
+		snmp := kcp.DefaultSnmp.Copy()
+		s.KCP = &KCPStats{
+			PacketsIn:     snmp.InPkts,
+			PacketsOut:    snmp.OutPkts,
+			Retransmitted: snmp.RetransSegs,
+			Lost:          snmp.LostSegs,
+			Duplicated:    snmp.RepeatSegs,
+			FECRecovered:  snmp.FECRecovered,
+			FECErrors:     snmp.FECErrs,
+		}
+	}
+	return s
+}
+
+// Write persists one snapshot. Failures are returned but are not worth
+// stopping a tunnel over — metrics are diagnostics, not function.
+func (c *Collector) Write() error {
+	s := c.Snapshot()
+	b, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(c.dir, 0755); err != nil {
+		return err
+	}
+	// Write to a temporary file and rename, so a reader never sees a half
+	// written snapshot.
+	tmp := Path(c.dir, c.name) + ".tmp"
+	if err := os.WriteFile(tmp, b, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, Path(c.dir, c.name))
+}
+
+// Run writes a snapshot every interval until the channel closes.
+func (c *Collector) Run(done <-chan struct{}, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			// A final write on the way out, so a clean restart loses only the
+			// traffic since the last tick rather than up to a whole interval.
+			_ = c.Write()
+			return
+		case <-ticker.C:
+			_ = c.Write()
+		}
+	}
+}
+
+// Read loads a tunnel's last snapshot. A missing file simply means the tunnel
+// has not written one yet.
+func Read(dir, name string) (Snapshot, error) {
+	var s Snapshot
+	b, err := os.ReadFile(Path(dir, name))
+	if err != nil {
+		return s, err
+	}
+	err = json.Unmarshal(b, &s)
+	return s, err
+}
+
+// Tunnel traffic counting.
+//
+// Only KCP used to report traffic, because kcp-go happens to keep process-wide
+// byte counters and the snapshot could just read them. Every other transport
+// reported "0 B in, 0 B out" — not because nothing was flowing, but because
+// nobody was counting.
+//
+// These counters fix that uniformly: the tunnel connection is wrapped, so a
+// read is data arriving from the peer and a write is data leaving for it,
+// whichever side of the tunnel this process is. One tunnel runs per process, so
+// package-level totals describe exactly this tunnel.
+var (
+	bytesIn  atomic.Uint64
+	bytesOut atomic.Uint64
+)
+
+// CountedConn wraps a tunnel connection so its traffic is recorded.
+//
+// It must be applied to the tunnel side, never the local one: wrapping both
+// would count the same bytes twice, since every byte crossing the tunnel is
+// also read from or written to a local socket.
+func CountedConn(c net.Conn) net.Conn { return &countedConn{Conn: c} }
+
+type countedConn struct{ net.Conn }
+
+func (c *countedConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		bytesIn.Add(uint64(n))
+	}
+	return n, err
+}
+
+func (c *countedConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		bytesOut.Add(uint64(n))
+	}
+	return n, err
+}
+
+// Uncount returns the connection underneath a CountedConn, reporting whether
+// there was one.
+//
+// Counting by wrapping only works while the bytes pass through this process.
+// The zero-copy relay hands the two sockets to the kernel and never sees the
+// data, so it has to reach the real *net.TCPConn — and then take over the
+// counting itself, which is what the second return value is for: it says which
+// side of the transfer was the tunnel side, and therefore whether what moves is
+// traffic in or traffic out.
+func Uncount(c net.Conn) (net.Conn, bool) {
+	if cc, ok := c.(*countedConn); ok {
+		return cc.Conn, true
+	}
+	return c, false
+}
+
+// AddBytes records traffic for transports that do not hand out a net.Conn —
+// the websocket ones read and write messages instead.
+func AddBytes(in, out uint64) {
+	if in > 0 {
+		bytesIn.Add(in)
+	}
+	if out > 0 {
+		bytesOut.Add(out)
+	}
+}
+
+// Traffic returns the bytes carried over the tunnel so far.
+func Traffic() (in, out uint64) { return bytesIn.Load(), bytesOut.Load() }
+
+// The server's own ledger: what tunnels that no longer exist carried.
+//
+// The panel's headline figure is "carried since this server was set up", and
+// it is added up from the tunnels' own files. Deleting a tunnel took its whole
+// history out of that sum, and left the file behind for the next tunnel given
+// the same name to start from. So a delete moves the tunnel's totals here, and
+// the file goes. It lives in the config directory beside the tunnels' files,
+// and so is inside every backup with them.
+
+// retiredFile is the ledger's name. Not "<name>.metrics.json": no tunnel may
+// ever be read as owning it.
+const retiredFile = "retired-traffic.json"
+
+type retired struct {
+	BytesIn  uint64 `json:"bytes_in"`
+	BytesOut uint64 `json:"bytes_out"`
+}
+
+// Retired is what the tunnels deleted from this server carried between them.
+func Retired(dir string) (in, out uint64) {
+	var r retired
+	path := filepath.Join(dir, retiredFile)
+	if b, err := os.ReadFile(path); err == nil {
+		// A damaged ledger is read as zero, so the server's lifetime total
+		// drops by whatever deleted tunnels carried. Said, because an empty
+		// ledger and a damaged one look identical on the overview.
+		if err := json.Unmarshal(b, &r); err != nil {
+			log.Printf("metrics: %s is damaged and is being read as zero — the traffic of "+
+				"deleted tunnels is missing from the server total: %v", path, err)
+			return 0, 0
+		}
+	}
+	return r.BytesIn, r.BytesOut
+}
+
+// Retire adds a deleted tunnel's totals to the server's ledger and removes the
+// tunnel's own file. Call it once the tunnel has stopped, so its last write is
+// in. A tunnel that never wrote a file has nothing to add.
+func Retire(dir, name string) error {
+	snap, err := Read(dir, name)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		// Unreadable: nothing can be carried over, but the file must still
+		// go, or a new tunnel of this name would try to start from it.
+		return os.Remove(Path(dir, name))
+	}
+	in, out := Retired(dir)
+	b, err := json.MarshalIndent(retired{BytesIn: in + snap.BytesIn, BytesOut: out + snap.BytesOut}, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, retiredFile)
+	if err := os.WriteFile(path+".tmp", b, 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(path+".tmp", path); err != nil {
+		return err
+	}
+	return os.Remove(Path(dir, name))
+}

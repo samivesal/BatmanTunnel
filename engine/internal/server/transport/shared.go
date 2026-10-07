@@ -1,0 +1,258 @@
+package transport
+
+import (
+	"crypto/subtle"
+	"fmt"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+
+	"github.com/backpack/backpack/internal/utils/network"
+)
+
+// controlClaimTimeout is how long the server waits for a freshly accepted peer
+// to say who it is before dropping it.
+//
+// It is the server's half of the number the client calls controlAckTimeout, and
+// it is generous for the same reason. The token arrives in the first segment
+// after the connection is up, so on a lossy path the wait is not a round trip
+// but a round trip plus however many retransmissions it takes to land: TCP's
+// first retransmission is a second out, the next three, the next seven. Two
+// seconds — which is what the udp transport asked for — covers barely one of
+// those, so on the kind of path this tunnel exists for the handshake failed,
+// the client backed off and dialled again, and the tunnel flapped without ever
+// being disconnected in any way the operator could see.
+//
+// Waiting longer costs one goroutine per silent peer and nothing else:
+// admission runs in the connection's own goroutine precisely so that a peer
+// which connects and says nothing never delays the ones behind it.
+const controlClaimTimeout = 15 * time.Second
+
+// tunnelHeaderTimeout bounds how long the ws/wsmux tunnel port waits for a
+// request's headers — and, on wss, for the TLS handshake, which net/http times
+// by the same setting.
+//
+// The port is public and unauthenticated until a request arrives, and it had
+// no bound at all: a peer that connected and sent nothing held a goroutine and
+// a file descriptor for as long as it liked, and a slow one also stalled the
+// server's graceful shutdown at every restart. Fifteen seconds is the budget
+// the direct engine's websocket listener already uses. net/http clears the
+// deadline once the headers are in, so an upgraded tunnel is not affected.
+// A variable so a test can shorten it.
+var tunnelHeaderTimeout = 15 * time.Second
+
+// portListen is one listener a forwarding mapping expands into: the address to
+// bind, and the port on its own, which is the target for a mapping that named
+// no destination and so forwards each port to itself.
+type portListen struct {
+	addr string
+	port string
+}
+
+// expandListenSpec expands the left-hand side of a forwarding mapping into the
+// listeners it asks for.
+//
+// The left-hand side is a port (`443`), a range (`443-450`), or either of those
+// with a local address in front of it (`10.0.0.5:443`, `[::1]:443-450`). A bare
+// port listens on every interface; naming an address pins that listener to one
+// local IP, which is what a multi-homed host needs in order to keep the control
+// channel and the exposed ports on separate public addresses — without it both
+// land on 0.0.0.0 and the second bind of a shared port number fails with
+// "address already in use".
+//
+// The address was previously understood for a single port only. Every transport
+// inlined this parsing and every one of them tested for "-" before it looked for
+// a host, so `10.0.0.5:443-450` took the range branch and handed the whole
+// string to strconv.Atoi, which fails. Splitting the host off first is what lets
+// a range carry one too, and writing it once is what keeps the seven transports
+// from disagreeing about it again.
+func expandListenSpec(spec string) ([]portListen, error) {
+	host, ports := splitListenHost(strings.TrimSpace(spec))
+
+	start, end, err := parsePortRange(ports)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]portListen, 0, end-start+1)
+	for p := start; p <= end; p++ {
+		port := strconv.Itoa(p)
+		// Not net.JoinHostPort: an IPv6 host arrives already bracketed, and
+		// JoinHostPort would bracket it a second time. An empty host leaves the
+		// familiar ":443" wildcard form.
+		out = append(out, portListen{addr: host + ":" + port, port: port})
+	}
+	return out, nil
+}
+
+// splitListenHost separates an optional bind address from the port or range
+// that follows it.
+//
+// IPv6 literals are written bracketed, so the separator is the first colon
+// after the closing bracket rather than the last colon in the string — an
+// unbracketed IPv6 address is indistinguishable from a host and port, and is no
+// more accepted here than net.Listen would accept it.
+func splitListenHost(spec string) (host, ports string) {
+	if i := strings.LastIndex(spec, "]"); i >= 0 {
+		if j := strings.Index(spec[i:], ":"); j >= 0 {
+			return spec[:i+j], spec[i+j+1:]
+		}
+		return spec, ""
+	}
+	if i := strings.LastIndex(spec, ":"); i >= 0 {
+		return spec[:i], spec[i+1:]
+	}
+	return "", spec
+}
+
+// parsePortRange reads "443" or "443-450" into an inclusive pair.
+func parsePortRange(spec string) (int, int, error) {
+	spec = strings.TrimSpace(spec)
+	lo, hi, isRange := strings.Cut(spec, "-")
+
+	start, err := parseListenPort(lo)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !isRange {
+		return start, start, nil
+	}
+
+	end, err := parseListenPort(hi)
+	if err != nil {
+		return 0, 0, err
+	}
+	if end < start {
+		return 0, 0, fmt.Errorf("port range ends before it starts: %s", spec)
+	}
+	return start, end, nil
+}
+
+// parseListenPort parses one port. The bound is inclusive at both ends: 1 and
+// 65535 are valid ports and the config validator accepts them, so a mapping
+// like `1=127.0.0.1:80` has to survive this. Every transport used to write the
+// check as `port > 1 && port < 65535`, which rejected both.
+func parseListenPort(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	p, err := strconv.Atoi(s)
+	if err != nil || p < 1 || p > 65535 {
+		return 0, fmt.Errorf("invalid port: %q", s)
+	}
+	return p, nil
+}
+
+// isTunnelRequest reports whether a request is a genuine tunnel connection —
+// a websocket upgrade, on a tunnel path, carrying a valid credential. Anything
+// else (a browser, a scanner, a probe with the wrong token) is not, and is
+// answered with the decoy site instead.
+func isTunnelRequest(r *http.Request, token string, simpleAuth bool) bool {
+	if !websocket.IsWebSocketUpgrade(r) {
+		return false
+	}
+	if r.URL.Path != "/channel" && !strings.HasPrefix(r.URL.Path, "/tunnel") {
+		return false
+	}
+	return authorizeWSRequest(r, token, simpleAuth)
+}
+
+// authorizeWSRequest checks the Authorization header on a websocket upgrade.
+//
+// Over plain ws there is no session to bind to, so the header carries the token
+// itself and is compared to the configured one. Over wss the client sends a
+// proof bound to the TLS session instead of the token, and the server recomputes
+// the expected proof from its own side of that session; a man in the middle that
+// terminated the client's TLS holds a different session and cannot produce it.
+// Either way the comparison is constant time, and a wss connection whose keying
+// material cannot be exported is rejected rather than waved through.
+//
+// simpleAuth turns the binding off and compares the raw token even over TLS.
+// That is exactly what the binding exists to prevent — anyone who terminates
+// the TLS then sees a token they could replay — so it is off by default. It is
+// here for one deployment the binding otherwise makes impossible: a TLS
+// terminating reverse proxy in front of the tunnel, NGINX being the usual one.
+// There the proxy legitimately holds a different TLS session from the client,
+// so a bound proof can never match; the operator who puts a trusted proxy there
+// is choosing to trust it with the token, which is the same thing the raw ws
+// transport already does.
+func authorizeWSRequest(r *http.Request, token string, simpleAuth bool) bool {
+	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+
+	if r.TLS == nil || simpleAuth {
+		return subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1
+	}
+
+	want, err := network.WSSServerProof(r.TLS, token)
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+type TunnelChannel struct { // for websocket
+	conn *websocket.Conn
+	ping chan struct{}
+	mu   *sync.Mutex
+}
+
+type LocalTCPConn struct {
+	conn        net.Conn
+	remoteAddr  string
+	timeCreated int64
+}
+
+type LocalUDPConn struct {
+	timeCreated int64
+	payload     chan []byte
+	remoteAddr  string
+	listener    *net.UDPConn
+	addr        *net.UDPAddr
+}
+
+type TunnelUDPConn struct {
+	timeCreated int64
+	payload     chan []byte
+	addr        *net.UDPAddr
+	listener    *net.UDPConn
+	ping        chan struct{}
+	mu          *sync.Mutex //mutex for ping channel
+}
+
+// The websocket buffers.
+//
+// The relay hands the websocket up to 64 KiB at a time (see handlers.relaybuf);
+// with a 16 KiB write buffer each of those went out as four frames and four
+// system calls, which held plain ws to 2.8 Gbit/s on loopback where wsmux made
+// 5; with these, and the relay reading each message through its pooled buffer
+// (handlers.transferWebSocketToTCP), it makes 6.7–7.0 (internal/e2e
+// TestTransportThroughput). A write
+// buffer is only in use while a message is being written, so they come from
+// one pool rather than one per connection — plain ws is a websocket per user,
+// and 64 KiB held for each would be the tunnel's memory. The read buffer stays
+// small: a read as large as the relay's goes around it straight into the
+// relay buffer.
+const (
+	wsReadBufferSize  = 16 * 1024
+	wsWriteBufferSize = 64 * 1024
+)
+
+var wsWriteBuffers = &sync.Pool{}
+
+// serverProof is the response header that proves this server holds the token,
+// on a wss upgrade bound to its TLS session (see network.WSSServerAnswer); nil
+// over plain ws, and with simpleAuth, where a proxy in front holds a different
+// session and no answer could match.
+func serverProof(r *http.Request, token string, simpleAuth bool) http.Header {
+	if r.TLS == nil || simpleAuth {
+		return nil
+	}
+	answer, err := network.WSSServerAnswer(r.TLS, token)
+	if err != nil {
+		return nil
+	}
+	return http.Header{network.WSSServerProofHeader: {answer}}
+}

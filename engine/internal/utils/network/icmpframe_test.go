@@ -1,0 +1,232 @@
+package network
+
+import (
+	"bytes"
+	"testing"
+)
+
+// The tag is derived, not exchanged, so the two ends of a tunnel must arrive at
+// the same one from the same token alone.
+func TestXdiTagIsDeterministic(t *testing.T) {
+	tag1 := xdiTag("a-shared-tunnel-token")
+	tag2 := xdiTag("a-shared-tunnel-token")
+	if tag1 != tag2 {
+		t.Fatalf("the same token produced two tags: %x vs %x", tag1, tag2)
+	}
+}
+
+// The echo identifier names a session, not a tunnel, so two sessions must never
+// be handed the same one. They used to be: it was derived from the token, which
+// made every session of a tunnel identical to kcp-go's listener and is why the
+// transport could not carry traffic at all.
+func TestEverySessionGetsItsOwnEchoIdentifier(t *testing.T) {
+	const sessions = 500
+	seen := map[uint16]struct{}{}
+	ids := make([]uint16, 0, sessions)
+
+	for i := 0; i < sessions; i++ {
+		id := acquireXdiSessionID()
+		if id == 0 {
+			t.Fatal("zero was issued; it is the identifier an unset field reads as")
+		}
+		if _, dup := seen[id]; dup {
+			t.Fatalf("identifier %d was issued twice — two sessions would share one address", id)
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+
+	// And released identifiers come back, or a long-lived client that opens and
+	// drops pool connections runs the space down.
+	for _, id := range ids {
+		releaseXdiSessionID(id)
+	}
+	// Every id released above has to become issuable again, or the pool drains
+	// and a tunnel that has reconnected enough times can no longer get one.
+	// Reusing a released id is the expected outcome; the failure being guarded
+	// is issuing stopping altogether.
+	for i := 0; i < sessions; i++ {
+		id := acquireXdiSessionID()
+		defer releaseXdiSessionID(id)
+		if id == 0 {
+			t.Fatalf("the session pool stopped issuing after %d releases", i)
+		}
+	}
+}
+
+// Two tunnels with different tokens must not share a tag — the tag is the whole
+// isolation guarantee. (A 16-bit identifier collision is tolerable because the
+// tag still separates them; a tag collision is not.)
+func TestDifferentTokensGetDifferentTags(t *testing.T) {
+	seen := map[[xdiTagLen]byte]string{}
+	for _, tok := range []string{
+		"token-one", "token-two", "token-three",
+		"aaaaaaaaaaaaaaaa", "aaaaaaaaaaaaaaab", "",
+		"a-real-looking-tunnel-token-0123456789",
+	} {
+		tag := xdiTag(tok)
+		if other, ok := seen[tag]; ok {
+			t.Fatalf("tokens %q and %q collided on tag %x", tok, other, tag)
+		}
+		seen[tag] = tok
+	}
+}
+
+// A packet encoded by one side must decode on the other, and the payload must
+// come back byte for byte.
+func TestEncodeDecodeRoundTrip(t *testing.T) {
+	tag := xdiTag("token")
+	payload := []byte("a KCP packet's worth of bytes \x00\x01\xff")
+
+	// server -> client
+	wire := encodeXdiPayload(tag, xdiDirServer, payload)
+	got, ok := decodeXdiPayload(tag, inboundDir(false), wire) // client accepts server dir
+	if !ok {
+		t.Fatal("the client rejected a packet the server sent it")
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload changed in transit: %q vs %q", got, payload)
+	}
+
+	// client -> server
+	wire = encodeXdiPayload(tag, xdiDirClient, payload)
+	if got, ok := decodeXdiPayload(tag, inboundDir(true), wire); !ok || !bytes.Equal(got, payload) {
+		t.Fatal("the server did not accept a packet the client sent it")
+	}
+}
+
+// The kernel's automatic echo reply is the case the direction byte exists for.
+// It carries the client's outbound payload — tag and all — bounced straight
+// back to the client. The client must reject it, or KCP would see its own
+// packets returned as if from the server.
+func TestKernelEchoReplyIsRejected(t *testing.T) {
+	tag := xdiTag("token")
+
+	// What the client sent: its outbound direction.
+	clientOutbound := encodeXdiPayload(tag, xdiDirClient, []byte("client data"))
+
+	// The kernel bounces that exact payload back to the client. The client,
+	// which accepts only the server's direction, must drop it.
+	if _, ok := decodeXdiPayload(tag, inboundDir(false), clientOutbound); ok {
+		t.Fatal("the client accepted the kernel's echo of its own packet")
+	}
+}
+
+// Another tunnel's traffic, arriving on the same raw socket, must be dropped on
+// the tag alone.
+func TestForeignTagIsRejected(t *testing.T) {
+	mine := xdiTag("my-token")
+	theirs := xdiTag("their-token")
+
+	theirPacket := encodeXdiPayload(theirs, xdiDirClient, []byte("not for me"))
+	if _, ok := decodeXdiPayload(mine, inboundDir(true), theirPacket); ok {
+		t.Fatal("one tunnel accepted another tunnel's packet")
+	}
+}
+
+// A bare ping — no framing at all, or too short to hold a header — must be
+// dropped rather than read past its end.
+func TestShortOrEmptyPayloadIsRejected(t *testing.T) {
+	tag := xdiTag("token")
+	for _, data := range [][]byte{
+		nil,
+		{},
+		{0x01},
+		tag[:], // the tag but no direction byte
+	} {
+		if _, ok := decodeXdiPayload(tag, xdiDirClient, data); ok {
+			t.Fatalf("a %d-byte payload was accepted", len(data))
+		}
+	}
+}
+
+// Each side sends its own direction and accepts the other's — never its own.
+func TestDirectionsAreOpposite(t *testing.T) {
+	if outboundDir(true) == outboundDir(false) {
+		t.Fatal("server and client send the same direction marker")
+	}
+	if outboundDir(true) != inboundDir(false) || outboundDir(false) != inboundDir(true) {
+		t.Fatal("one side's outbound is not the other's inbound")
+	}
+	if inboundDir(true) == outboundDir(true) {
+		t.Fatal("a side accepts its own direction — it would read its own kernel echoes")
+	}
+}
+
+// KCP is told a smaller MTU over ICMP than over UDP, because the echo header
+// and the tunnel's own framing eat into the packet. Getting this wrong would
+// let a full-window KCP packet fragment — the one thing the MTU setting exists
+// to prevent.
+func TestEffectiveMTUShrinksOverICMP(t *testing.T) {
+	udp := KCPSettings{MTU: 1350, UseICMP: false}
+	if udp.effectiveMTU() != 1350 {
+		t.Errorf("UDP MTU changed: got %d, want 1350", udp.effectiveMTU())
+	}
+
+	icmp := KCPSettings{MTU: 1350, UseICMP: true}
+	got := icmp.effectiveMTU()
+	if got != 1350-icmpMTUOverhead {
+		t.Errorf("ICMP effective MTU = %d, want %d", got, 1350-icmpMTUOverhead)
+	}
+	if got >= udp.effectiveMTU() {
+		t.Error("the ICMP MTU is not smaller than the UDP one")
+	}
+	// The overhead must cover the real headers: 8-byte ICMP echo header plus
+	// the tag-and-direction prefix. Anything less would fragment.
+	if icmpMTUOverhead < 8+xdiHeaderLen {
+		t.Errorf("overhead %d is too small for the ICMP and framing headers", icmpMTUOverhead)
+	}
+}
+
+// The pooled encoder must produce exactly what the allocating one does.
+//
+// The send path uses the pooled form because it runs once per packet; the two
+// drifting apart would mean the tunnel frames its packets one way and the tests
+// check another.
+func TestPooledXdiEncodingMatchesTheAllocatingOne(t *testing.T) {
+	var tag [xdiTagLen]byte
+	copy(tag[:], []byte{0xDE, 0xAD, 0xBE, 0xEF})
+
+	for _, payload := range [][]byte{
+		nil,
+		{1},
+		[]byte("a short packet"),
+		make([]byte, 1400),
+	} {
+		want := encodeXdiPayload(tag, xdiDirClient, payload)
+
+		buf := make([]byte, 0, 64) // deliberately too small, to force growth
+		got := appendXdiPayload(buf, tag, xdiDirClient, payload)
+
+		if !bytes.Equal(got, want) {
+			t.Fatalf("payload of %d bytes: pooled encoding differs from the allocating one",
+				len(payload))
+		}
+		// And it must still decode as this tunnel's inbound traffic.
+		back, ok := decodeXdiPayload(tag, xdiDirClient, got)
+		if !ok || !bytes.Equal(back, payload) {
+			t.Fatalf("payload of %d bytes did not survive the round trip", len(payload))
+		}
+	}
+}
+
+// Reusing the buffer must not leave anything of the previous packet behind.
+func TestPooledXdiEncodingDoesNotLeakThePreviousPacket(t *testing.T) {
+	var tag [xdiTagLen]byte
+	buf := make([]byte, 0, 4096)
+
+	long := bytes.Repeat([]byte{0xAA}, 2000)
+	_ = appendXdiPayload(buf, tag, xdiDirServer, long)
+
+	short := []byte{1, 2, 3}
+	got := appendXdiPayload(buf, tag, xdiDirServer, short)
+
+	if len(got) != xdiHeaderLen+len(short) {
+		t.Fatalf("a short packet after a long one came out %d bytes, want %d",
+			len(got), xdiHeaderLen+len(short))
+	}
+	back, ok := decodeXdiPayload(tag, xdiDirServer, got)
+	if !ok || !bytes.Equal(back, short) {
+		t.Fatalf("the short packet decoded as %x", back)
+	}
+}

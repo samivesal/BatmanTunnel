@@ -1,0 +1,1127 @@
+/* Settings: panel access, security, the bot, and the release channel.
+ *
+ * CLI: 5 Web Panel, 7 Telegram Bot, 8 Update → Release channel.
+ */
+
+import { $$, el, esc, dialogSubtitle, copyText, flashCopied } from '../lib/dom.js';
+import * as api from '../api.js';
+import * as store from '../store.js';
+import { openScreen } from '../ui/screen.js';
+import { oops, toast } from '../ui/toast.js';
+import { confirmBox } from '../ui/confirm.js';
+import { isUp } from '../lib/tstate.js';
+import { go } from '../router.js';
+
+/* A <select> keeps its first option when the value it is handed matches none
+   of them, which is how "turbo" quietly displayed as "Balanced". The server
+   speaks in values ("turbo", "wss"); the preview's options were written with
+   labels. Match either, and say so when neither fits. */
+function setControl(node, v) {
+  if (node.type === 'checkbox') { node.checked = !!v; return; }
+  const val = Array.isArray(v) ? v.join(', ') : String(v ?? '');
+  if (node.tagName !== 'SELECT') { node.value = val; return; }
+  const want = val.trim().toLowerCase();
+  const hit = [...node.options].find(o =>
+    o.value.trim().toLowerCase() === want || o.textContent.trim().toLowerCase() === want);
+  if (hit) { node.value = hit.value; return; }
+  /* Nothing matched: show the server's value rather than a wrong one. */
+  const opt = new Option(val, val, true, true);
+  node.add(opt);
+}
+
+const shortDate = t => {
+  const d = new Date(t);
+  return isNaN(d) ? '—' : d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+};
+
+const dig = (o, path) => path.split('.').reduce((x, k) => (x ?? {})[k], o);
+
+function fill(root, values, prefix = '') {
+  /* Controls carry the key their endpoint reads, dotted where the payload
+     nests (alerts.cpu), so one pass fills all four endpoints' fields. */
+  root.querySelectorAll('[name]').forEach(n => {
+    const v = dig(values, n.name);
+    if (v === undefined || v === null) return;
+    setControl(n, v);
+  });
+  for (const [k, v] of Object.entries(values || {})) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) { fill(root, v, k + '.'); continue; }
+    const key = prefix + k;
+    const node = root.querySelector(`[name="${key}"], [name="${k}"], #${CSS.escape(k)}`);
+    if (!node) continue;
+    if (node.type === 'checkbox') node.checked = !!v;
+    else if (node.classList?.contains('sw6') || node.classList?.contains('switch')) {
+      node.classList.toggle('on', !!v);
+      node.setAttribute('aria-pressed', String(!!v));
+    } else node.value = v ?? '';
+  }
+}
+
+/* The rail's one-line summaries and the version list were drawn with example
+   values. They are rewritten from what the server reports, because a summary
+   that is decoration is a summary that lies the first time something changes. */
+function summarise(root, { tg, ses, ab, upd, cert }) {
+  /* Every line is written, always.
+   *
+   * This used to skip the write when it had nothing to say — `if (line && text)`
+   * — and what is underneath is not blank. It is the preview's own sample text,
+   * drawn by whoever designed the screen: "2FA on · 2 devices" on a panel with
+   * no two-factor at all, and "Connected" for a bot that was never configured.
+   * So the one case where the panel knew least was the case where it made the
+   * most confident claim, and an operator whose session list failed to load was
+   * told about two devices that do not exist.
+   *
+   * A line with no data says so. "Could not be read" is worth more than a
+   * plausible sentence. */
+  const say = (label, text) => {
+    for (const b of root.querySelectorAll('b')) {
+      if (b.textContent.trim() !== label) continue;
+      const line = b.nextElementSibling;
+      if (line) line.textContent = text || 'could not be read';
+      return b;
+    }
+  };
+  /* The port and the certificate, from the endpoint that knows both.
+   *
+   * It read stats.panelPort, and the stats payload has no such field — it never
+   * has — so the port half was always undefined and the line fell back to
+   * naming the scheme of the address the browser happened to use. That is not
+   * the same question: a panel reached through a reverse proxy is https to the
+   * browser and plain http to itself, and the port it is actually served on is
+   * the one an operator needs when they are about to change it. */
+  const certLabel = { acme: "Let's Encrypt", self: 'self-signed HTTPS', http: 'plain HTTP', own: 'own certificate' };
+  say('Panel access', cert
+    ? [cert.port ? 'Port ' + cert.port : null, certLabel[cert.mode] || null]
+      .filter(Boolean).join(' · ')
+    : '');
+  say('Security', ses
+    ? `${ses.length} signed-in device${ses.length === 1 ? '' : 's'}`
+    : '');
+  say('Telegram bot', tg ? (tg.configured ? 'Connected' : 'Not configured') : '');
+  /* The rail is one short line per group; a full sentence wraps and pushes the
+     rest of the list down, so the summary is the fact, not the explanation. */
+  const when = t => {
+    const d = new Date(t), day = 864e5;
+    const gap = Date.now() - d.getTime();
+    if (gap < day) return 'today ' + d.toTimeString().slice(0, 5);
+    if (gap < 2 * day) return 'yesterday ' + d.toTimeString().slice(0, 5);
+    return `${Math.floor(gap / day)} days ago`;
+  };
+  say('Backup', ab ? (ab.last ? when(ab.last) : (ab.enabled ? 'weekly, none taken yet' : 'off')) : '');
+  const tag = upd?.summary?.match(/v?[\d.]+/)?.[0];
+  const u = say('Update', upd ? (upd.available && tag ? `${tag} available` : 'up to date') : '');
+  if (u) {
+    /* The dot sits inside the label itself (.flag2), and it was drawn lit on
+       every server whether or not anything was out. */
+    const dot = u.querySelector('.flag2') || u.parentElement?.querySelector('.dot, .badge');
+    if (dot) dot.hidden = !upd?.available;
+  }
+}
+
+export function settingsView(ctx) {
+  openScreen('settings', {
+    pick: '.dlg',
+    bind: async (root, close) => {
+      dialogSubtitle(root, store.get().stats,
+        'changes apply as you make them unless a control says otherwise');
+      const [tg, ch, ses, ab, upd, cert] = await Promise.allSettled([
+        api.telegram(), api.channel(), api.sessions(),
+        api.autoBackup(), api.updateCheck(), api.panelCertRead(),
+      ]);
+      const val = r => (r.status === 'fulfilled' ? r.value : null);
+      /* The faces of the switches and menus are set from these at the end of
+         the bind. They were read there under these names and never declared,
+         so the last step of the screen threw on every open. */
+      const tgNow = val(tg) || {};
+      const abNow = val(ab) || {};
+      const chNow = val(ch) || {};
+
+      /* Buttons matched by what they say, because the preview gave most of them
+         no id. Declared here rather than beside its first use: it was a const
+         further down the file and two calls sat above it, so the whole bind
+         threw on "Cannot access 'byText' before initialization" — and every
+         control after that line, from Revoke to Save bot, was never wired. */
+      const byText = re => [...root.querySelectorAll('button')]
+        .filter(b => re.test(b.textContent.trim()));
+
+      /* Two panes both call their button "Save" — the panel's port and the
+         Telegram bot's settings. Matching on the word alone gave both of them
+         the port handler, so the bot's token, admin and thresholds had no way
+         to be saved at all, and pressing Save under Telegram with a port typed
+         in would have moved the panel. Panes are how they are told apart. */
+      const inPane = k => root.querySelector(`[data-p="${k}"]`);
+      const byTextIn = (k, re) => {
+        const pane = inPane(k);
+        return pane ? [...pane.querySelectorAll('button')].filter(b => re.test(b.textContent.trim())) : [];
+      };
+
+      if (tg.status === 'fulfilled') fill(root, tg.value);
+      if (ch.status === 'fulfilled') fill(root, ch.value);
+      summarise(root, {
+        tg: val(tg), ses: val(ses), ab: val(ab), upd: val(upd), cert: val(cert),
+      });
+
+      /* ---- Two-factor sign-in ----
+       *
+       * Built here rather than drawn in the preview's markup, because the
+       * preview's Security pane claimed "2FA on · 2 devices" on a panel that
+       * had no second factor at all — and the lesson of that line is not to put
+       * a feature's chrome on screen before the feature exists.
+       *
+       * The flow is three states and they are three because each one is a
+       * different decision: off, enrolling (a secret to scan, not yet in
+       * force), and on. Enrolling deliberately does not take effect until a
+       * code comes back: an operator who closes the tab after the QR code is an
+       * operator who would otherwise be locked out by a secret nothing holds. */
+      {
+        const pane = inPane('security');
+        const host = el('div', { class: 'grp2', id: 'twofagrp' });
+        pane?.insertBefore(host, root.querySelector('#tokgrp'));
+
+        const ask = (label, id) => `<div class="f2b"><label>${label}</label>`
+          + `<input id="${id}" type="password" placeholder="Panel password"></div>`;
+
+        const showCodes = codes => `<pre class="tokout">${esc(codes.join('\n'))}\n\n`
+          + `Keep these somewhere that is not this server. Each one signs you in once, `
+          + `and they are the way back if the phone is gone.</pre>`;
+
+        const draw = st => {
+          if (st.enabled) {
+            host.innerHTML = `<div class="gl2">Two-factor sign-in</div>
+              <div class="arow"><div class="tx"><b>On</b>
+                <span>${st.recoveryLeft} recovery ${st.recoveryLeft === 1 ? 'code' : 'codes'} unused</span></div>
+                <button class="btn2" id="tfnew">New recovery codes</button>
+                <button class="btn2 dgr" id="tfoff">Turn off</button></div>
+              ${ask('Confirm with the panel password', 'tfpw')}
+              <div id="tfout"></div>`;
+            return;
+          }
+          host.innerHTML = `<div class="gl2">Two-factor sign-in</div>
+            <p class="hint" style="margin:0 0 10px">This panel is root on this machine and one
+              password opens it. A code from an authenticator app is the second thing somebody
+              would have to have.</p>
+            <div class="arow"><div class="tx"><b>Off</b>
+              <span>The password is the whole login</span></div>
+              <button class="btn2 solid" id="tfon">Turn on</button></div>
+            <div id="tfout"></div>`;
+        };
+
+        const out = () => host.querySelector('#tfout');
+        const pw = () => host.querySelector('#tfpw')?.value || '';
+
+        let status = { enabled: false, recoveryLeft: 0 };
+        try { status = await api.totp(); } catch (e) { /* drawn as off */ }
+        draw(status);
+
+        host.addEventListener('click', async ev => {
+          const id = ev.target.id;
+          try {
+            if (id === 'tfon') {
+              const st = await api.totpStart();
+              out().innerHTML = `<pre class="tokout">${esc(st.secret)}</pre>
+                <p class="hint">Scan this in the app, or type the key above by hand.
+                  <a href="${esc(st.uri)}">Open in an authenticator app</a></p>
+                <div class="f2b"><label>The six digits it shows</label>
+                  <input id="tfcode" type="text" inputmode="numeric" maxlength="6" placeholder="000000"></div>
+                <button class="btn2 solid" id="tfconfirm">Confirm</button>`;
+              return;
+            }
+            if (id === 'tfconfirm') {
+              const code = host.querySelector('#tfcode')?.value.trim();
+              if (!code) { toast('Enter the code the app is showing.'); return; }
+              const r = await api.totpConfirm(code);
+              draw({ enabled: true, recoveryLeft: (r.recovery || []).length });
+              out().innerHTML = showCodes(r.recovery || []);
+              toast('Two-factor is on.');
+              return;
+            }
+            if (id === 'tfoff') {
+              if (!await confirmBox({
+                title: 'Turn two-factor off?',
+                body: 'The password becomes the whole login again, and the recovery codes stop working.',
+                go: 'Turn off' })) return;
+              await api.totpDisable(pw());
+              draw({ enabled: false, recoveryLeft: 0 });
+              toast('Two-factor is off.');
+              return;
+            }
+            if (id === 'tfnew') {
+              const r = await api.totpRecovery(pw());
+              draw({ enabled: true, recoveryLeft: (r.recovery || []).length });
+              out().innerHTML = showCodes(r.recovery || []);
+              toast('New recovery codes — the old ones no longer work.');
+            }
+          } catch (e) { oops(e); }
+        });
+      }
+
+      /* ---- API tokens and the record ----
+       *
+       * Both live under Security because both answer the same question: who
+       * can reach this panel and with what. A token is the answer for
+       * everything that is not a browser, and the record is the answer to what
+       * has already been done. */
+      {
+        const list = root.querySelector('#toklist');
+        const out  = root.querySelector('#toksecret');
+        const log  = root.querySelector('#audlog');
+
+        const when = ts => (ts ? new Date(ts * 1000).toLocaleDateString() : '—');
+
+        const drawTokens = rows => {
+          if (!list) return;
+          if (!rows.length) {
+            list.innerHTML = '<div class="arow"><div class="tx"><b>No tokens</b>'
+              + '<span>Nothing but a browser can reach this panel.</span></div></div>';
+            return;
+          }
+          /* Expired and never-used are called out, because the reason the
+             previous token was removed was that nobody could tell a live one
+             from a dead one and so nobody ever pruned them. */
+          list.innerHTML = rows.map(t => {
+            const state = t.expired
+              ? '<span class="gone">expired</span>'
+              : (t.unused ? '<span class="idle">never used</span>'
+                          : `last used ${when(t.lastUsed)}`);
+            return `<div class="arow"><div class="tx"><b>${esc(t.name)}</b>
+              <span>${esc(t.scope)} · expires ${when(t.expires)} · ${state}</span></div>
+              <button class="btn2 dgr" data-revoke-token="${esc(t.name)}">Revoke</button></div>`;
+          }).join('');
+        };
+
+        try { drawTokens((await api.tokens()).tokens || []); }
+        catch (e) { if (list) list.textContent = 'Could not read the tokens.'; }
+
+        list?.addEventListener('click', async ev => {
+          const name = ev.target.closest('[data-revoke-token]')?.dataset.revokeToken;
+          if (!name) return;
+          if (!await confirmBox({
+            title: `Revoke ${esc(name)}?`,
+            body: 'Anything still using it stops working immediately. It cannot be undone — a new token would be a new secret.',
+            go: 'Revoke' })) return;
+          try { drawTokens((await api.tokenRevoke(name)).tokens || []); toast(`${name} revoked.`); drawAudit(); }
+          catch (e) { oops(e); }
+        });
+
+        root.querySelector('#tokmake')?.addEventListener('click', async () => {
+          const name = root.querySelector('[name="tokName"]')?.value.trim();
+          if (!name) { toast('Give the token a name.'); return; }
+          const scope = root.querySelector('[data-name="tokScope"]')?.dataset.value || 'read';
+          const days = parseInt(root.querySelector('[name="tokDays"]')?.value, 10) || 90;
+          try {
+            const r = await api.tokenIssue({ name, scope, days });
+            drawTokens(r.tokens || []);
+            if (out) {
+              out.hidden = false;
+              /* Said in full, because there is no second chance to read it. */
+              out.textContent =
+                `${r.secret}\n\nCopy it now — this is the only time it is shown.\n`
+                + `Use it as:  Authorization: Bearer <token>`;
+            }
+            root.querySelector('[name="tokName"]').value = '';
+            drawAudit();
+          } catch (e) { oops(e); }
+        });
+
+        /* Redrawn after an issue or a revoke too: both are recorded, and a
+           record that does not show the line just written reads as one that
+           did not write it. */
+        /* The record is a hash chain (see audit.go): the first line says
+           whether it still holds, and names its head — the same number every
+           line forwarded to Telegram carries, which is how a rewrite that
+           recomputed the chain is still caught. */
+        /* Drawn as rows in the screen's own type, not as a monospace dump: the
+           dump was a second typeface and a second size in the middle of a pane
+           set in the body face, and it read as something pasted in. */
+        const sealEl = root.querySelector('#audseal');
+        const drawAudit = async () => {
+          try {
+            const a = await api.audit(200);
+            const rows = a.entries || [];
+            if (sealEl) {
+              sealEl.hidden = !(a.intact === false || a.head);
+              sealEl.className = 'audseal ' + (a.intact === false ? 'bad' : 'ok');
+              sealEl.innerHTML = a.intact === false
+                ? `<i></i><span><b>This record has been altered.</b> Entry ${a.brokenAt + 1} from the top does not follow from the one before it.</span>`
+                : `<i></i><span><b>Record intact</b> · head <code>#${esc(a.head || '')}</code> — compare with the number on the latest Telegram notice.</span>`;
+            }
+            if (!log) return;
+            log.innerHTML = rows.length ? rows.map(e => {
+              const d = new Date(e.at * 1000);
+              const refused = e.status >= 400;
+              const what = (e.path || '').replace(/^\/api\//, '') + (e.action ? ` · ${e.action}` : '');
+              return `<div class="aud${refused ? ' no' : ''}">
+                <span class="at" title="${esc(d.toLocaleString())}">${esc(d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }))}<em>${esc(d.toTimeString().slice(0, 5))}</em></span>
+                <span class="wh"><b>${esc(what)}</b><small>${esc([e.who, e.ip].filter(Boolean).join(' · '))}</small></span>
+                <span class="st">${refused ? `refused ${e.status}` : esc(e.method || '')}</span></div>`;
+            }).join('') : '<div class="audnone">Nothing has been changed through this panel yet.</div>';
+          } catch (e) { if (log) log.innerHTML = '<div class="audnone">Could not read the record.</div>'; }
+        };
+        await drawAudit();
+      }
+
+      /* The footer note.
+       *
+       * It read "Five groups · the two marked with a dot differ from the
+       * default", and nothing on this screen marks anything with a dot or knows
+       * what a default would be — it was the preview describing a drawing of
+       * itself. The count is the part that is true and worth keeping, so it is
+       * counted rather than asserted. */
+      {
+        const note = root.querySelector('.df .note');
+        const n = root.querySelectorAll('.rail3 [data-k]').length;
+        if (note && n) {
+          note.textContent = `${n} groups · changes take effect as they are saved.`;
+        }
+      }
+
+      /* Sessions are a list, not a field. The preview drew two example rows;
+         they are replaced by the real ones, or by a line saying there is one. */
+      if (ses.status === 'fulfilled') {
+        /* The rows are the preview's two invented devices — "Chrome on macOS ·
+           Tehran · now" and an iPhone — until they are replaced. They were
+           looked for under .dl/.list/.rows, and this markup has none of those,
+           so the replacement never ran and every panel showed the same two
+           strangers as its signed-in devices. They are .arow inside the group
+           the heading names. */
+        const group = [...root.querySelectorAll('[data-p="security"] .grp2')]
+          .find(g => /signed-in devices/i.test(g.querySelector('.gl2')?.textContent || ''));
+        if (group) {
+          const rows = ses.value || [];
+          group.querySelectorAll('.arow').forEach(r => r.remove());
+          const others = group.querySelector('button');
+          const html = rows.length ? rows.map(x => `
+            <div class="arow"><div class="tx">
+              <b>${esc(x.current ? 'This device' : (x.ip || 'unknown address'))}</b>
+              <span>${esc([x.ip, x.created].filter(Boolean).join(' · ') || 'signed in')}</span>
+            </div>${x.current
+              ? '<button class="btn2" disabled>Current</button>'
+              : `<button class="btn2 dgr" data-revoke="${esc(x.id)}">Sign out</button>`}</div>`).join('')
+            : `<div class="arow"><div class="tx"><b>No other device is signed in</b>
+                 <span>Only this one.</span></div></div>`;
+          if (others) others.insertAdjacentHTML('beforebegin', html);
+          else group.insertAdjacentHTML('beforeend', html);
+          if (others) others.hidden = !rows.some(x => !x.current);
+
+          group.addEventListener('click', async ev => {
+            const b = ev.target.closest('[data-revoke]');
+            if (!b) return;
+            try {
+              await api.sessionRevoke(b.dataset.revoke);
+              toast('Signed out.');
+              b.closest('.arow')?.remove();
+            } catch (e) { oops(e); }
+          });
+        }
+      }
+
+      /* The certificate section, which was a drawing.
+       *
+       * Three options are drawn — plain HTTP, self-signed, Let's Encrypt — and
+       * none of them was a control: nothing selected one, nothing read one, and
+       * Apply posted a domain and an email with no mode at all, which is the one
+       * field the endpoint cannot do without. Every attempt came back "unknown
+       * mode", so the panel could not be put behind a certificate of any kind
+       * from this screen, Let's Encrypt included. The address above it was the
+       * preview's made-up domain on the preview's port.
+       */
+      const certOpts = [...root.querySelectorAll('.opt2[data-mode]')];
+      let certMode = 'self';
+      /* Held, not looked up: the label changes with the mode, and finding it by
+         its text again afterwards finds nothing. */
+      const applyCertBtn = byText(/^apply certificate$/i)[0];
+
+      const paintCert = snap => {
+        certOpts.forEach(o => o.classList.toggle('on', o.dataset.mode === certMode));
+        /* A domain belongs to Let's Encrypt; on self-signed the same field is an
+           optional extra name, and on plain HTTP it means nothing at all. */
+        const domRow = root.querySelector('[name="domain"]')?.closest('.f2b');
+        const mailRow = root.querySelector('[name="email"]')?.closest('.f2b');
+        if (domRow) domRow.hidden = certMode === 'http' || certMode === 'own';
+        if (mailRow) mailRow.hidden = certMode !== 'acme';
+        /* The two files belong to "my own certificate" and to nothing else. */
+        for (const n of ['certFile', 'keyFile']) {
+          const row = root.querySelector(`[name="${n}"]`)?.closest('.f2b');
+          if (row) row.hidden = certMode !== 'own';
+        }
+        if (applyCertBtn) {
+          applyCertBtn.textContent = certMode === 'http' ? 'Turn HTTPS off' : 'Apply certificate';
+        }
+
+        if (!snap) return;
+        /* "-" is what the server reports when it could not work out its own
+           public address; the address the operator actually reached this page
+           on is a better answer than a dash. */
+        const pub = snap.publicIp && snap.publicIp !== '-' ? snap.publicIp : '';
+        const host = snap.domain || pub || location.hostname;
+        const sch = certMode === 'http' ? 'http://' : 'https://';
+        const uScheme = root.querySelector('#uScheme');
+        const uHost = root.querySelector('#uHost');
+        const uPort = root.querySelector('#uPort');
+        if (uScheme) uScheme.textContent = sch;
+        if (uHost) uHost.textContent = host;
+        if (uPort) uPort.textContent = snap.port ? ':' + snap.port : '';
+        /* The path the panel is served under. It is part of the address now,
+           and the half nobody can reconstruct — an operator reading this line
+           to write the address down has to see all of it. */
+        const uPath = root.querySelector('#uPath');
+        if (uPath) uPath.textContent = api.base() + '/';
+        const lock = root.querySelector('#lockw');
+        if (lock) lock.className = 'lockw ' + (certMode === 'acme' || certMode === 'own' ? 'safe'
+          : certMode === 'self' ? 'warn' : 'off');
+        const note = root.querySelector('#uNote');
+        if (note) {
+          note.innerHTML = certMode === 'own'
+            ? (snap.mode === 'own' && snap.names
+                ? `<b>Your certificate.</b> For ${esc(snap.names.join(', '))}`
+                  + (snap.expires ? ` — until ${esc(snap.expires)}.` : '.')
+                : '<b>Your certificate.</b> Trusted if it was issued for the name you open the panel by.')
+            : certMode === 'acme'
+            ? `<b>Trusted by every browser.</b> ${esc(snap.acmeNote || '')}`
+            : certMode === 'self'
+              ? '<b>The browser warns once.</b> It works on a bare IP, and the warning '
+                + 'is accepted per device. Installing it as an app needs a trusted '
+                + 'certificate — only an iPhone adds it to the home screen anyway.'
+              : '<b>No certificate.</b> The page travels in the clear and cannot be '
+                + 'installed as an app.';
+        }
+        /* An option that cannot work here says so rather than failing after the
+           restart, which is when the panel is already unreachable. */
+        const acme = certOpts.find(o => o.dataset.mode === 'acme');
+        if (acme) {
+          const why = acme.querySelector('i');
+          if (!snap.acmePath) {
+            acme.classList.add('off');
+            if (why) why.textContent = snap.acmeNote || 'Let’s Encrypt cannot verify this server right now.';
+          } else if (why) {
+            why.textContent = 'A trusted certificate, renewed on its own. ' + (snap.acmeNote || '');
+          }
+        }
+      };
+
+      /* The same read the rail above used; asking twice would be two answers to
+         one question, and they can differ. */
+      let certSnap = val(cert);
+      if (certSnap) {
+        certMode = certSnap.mode || 'self';
+        const d = root.querySelector('[name="domain"]');
+        if (d) d.value = certSnap.domain || certSnap.selfHost || '';
+        const e2 = root.querySelector('[name="email"]');
+        if (e2) e2.value = certSnap.email || '';
+        const pp = root.querySelector('[name="port"]');
+        if (pp && certSnap.port) pp.value = certSnap.port;
+        const cf = root.querySelector('[name="certFile"]');
+        if (cf) cf.value = certSnap.certFile || '';
+        const kf = root.querySelector('[name="keyFile"]');
+        if (kf) kf.value = certSnap.keyFile || '';
+      } /* else the section still selects, it just starts on self-signed */
+      /* ---- The panel's own path, login code and restart ----
+       *
+       * Web Panel → Panel Path, New Login Code and Restart Panel in the menu.
+       * Every one ends in the panel restarting, so each says where it will be
+       * afterwards and the page goes there itself. */
+      {
+        const pane = inPane('access');
+        const portGrp = pane?.querySelector('.grp2:nth-of-type(1)') ? [...pane.querySelectorAll('.grp2')]
+          .find(g => /^port$/i.test(g.querySelector('.gl2')?.textContent.trim() || '')) : null;
+        const host = el('div', { class: 'grp2', id: 'pselfgrp' });
+        if (pane) (portGrp ? portGrp.after(host) : pane.append(host));
+        let self = null;
+        try { self = await api.panelSelf(); } catch (e) { /* drawn without the current path */ }
+        const where = path => `${location.protocol}//${location.host}${path || ''}/`;
+        const draw = () => {
+          host.innerHTML = `<div class="gl2">Address path</div>
+            <p class="hint">The secret segment the panel answers under — what a port scan finds instead of a login page.
+              Change it when it stops being secret: pasted in a chat, left on a screenshot.</p>
+            <div class="arow"><div class="tx"><b><code>${esc((self?.path || '') + '/')}</code></b>
+              <span>${self?.path ? 'Anything else on this port is a 404' : 'At the root — found by any scan of the port'}</span></div>
+              <button class="btn2" data-ps="random">New random path</button></div>
+            <div class="inline"><div class="f2b"><label>My own path<span class="sub3">letters, digits, - and _</span></label>
+              <input name="basePath" type="text" placeholder="e.g. my-panel-2026" autocomplete="off" spellcheck="false"></div>
+              <button class="btn2" data-ps="custom">Use it</button>
+              <button class="btn2 dgr" data-ps="none">No path</button></div>
+            <div class="gl2" style="margin-top:18px">Login code and restart</div>
+            <div class="arow"><div class="tx"><b>New login code</b>
+              <span>A fresh random 8-digit password. Every device is signed out, this one too.</span></div>
+              <button class="btn2" data-ps="code">Generate</button></div>
+            <div class="arow"><div class="tx"><b>Restart the panel</b>
+              <span>Tunnels are not touched. This page reconnects by itself in a few seconds.</span></div>
+              <button class="btn2" data-ps="restart">Restart</button></div>
+            <div id="psout"></div>`;
+        };
+        draw();
+        /* The panel restarts a moment after answering; wait for it to answer
+           again at its new address before moving there. */
+        const followTo = url => {
+          const t0 = Date.now();
+          const tick = async () => {
+            try {
+              const r = await fetch(url + 'login', { cache: 'no-store' });
+              if (r.ok) { location.href = url; return; }
+            } catch (e) { /* still restarting */ }
+            if (Date.now() - t0 < 30000) setTimeout(tick, 1200);
+            else location.href = url;
+          };
+          setTimeout(tick, 1500);
+        };
+        host.addEventListener('click', async ev => {
+          const b = ev.target.closest('[data-ps]');
+          if (!b) return;
+          const act = b.dataset.ps;
+          const out = host.querySelector('#psout');
+          try {
+            if (act === 'restart') {
+              if (!await confirmBox({ title: 'Restart the panel?', body: 'Tunnels keep running. The page reconnects on its own.', go: 'Restart' })) return;
+              await api.panelRestart();
+              toast('Restarting the panel…');
+              followTo(where(self?.path));
+              return;
+            }
+            if (act === 'code') {
+              if (!await confirmBox({ title: 'Generate a new login code?', body: 'The current password stops working and every device is signed out, including this one.', go: 'Generate', danger: true })) return;
+              const r = await api.panelNewCode();
+              /* Shown once, big, with a copy — the old password is already gone. */
+              out.innerHTML = `<div class="caution" style="margin-top:12px"><span class="ic3">!</span><span>
+                New login code: <b style="font-size:15px;letter-spacing:.12em"><code id="pscode">${esc(r.code)}</code></b>
+                <button class="btn2" id="pscopy" style="margin-left:8px">Copy</button><br>
+                Write it down now — you will be signed out when the panel restarts.</span></div>`;
+              out.querySelector('#pscopy')?.addEventListener('click', async e2 =>
+                flashCopied(e2.currentTarget, await copyText(r.code)));
+              setTimeout(() => followTo(where(self?.path)), 8000);
+              return;
+            }
+            const custom = host.querySelector('[name="basePath"]')?.value.trim() || '';
+            if (act === 'custom' && !custom) { toast('Type the path first.', true); return; }
+            const next = act === 'random' ? 'a new random path' : act === 'none' ? 'the root, with no path' : `/${custom}/`;
+            if (!await confirmBox({
+              title: `Move the panel to ${esc(next)}?`,
+              body: 'The current address stops working at once. This page follows the panel to the new one — note it down.',
+              go: 'Move', danger: act === 'none',
+            })) return;
+            const r = await api.panelPath(act, custom);
+            self = { ...(self || {}), path: r.path };
+            const url = where(r.path);
+            out.innerHTML = `<div class="caution" style="margin-top:12px"><span class="ic3">→</span>
+              <span>The panel now answers at <code>${esc(url)}</code> — going there as soon as it is back.</span></div>`;
+            followTo(url);
+          } catch (e) { oops(e); }
+        });
+      }
+
+      /* Copy the address this section spells out. It had no handler of its
+         own: the shared one looks for an input or a code element beside the
+         button, and the address is five spans, so it found nothing and the
+         button did nothing. */
+      root.querySelector('.cp2')?.addEventListener('click', async ev => {
+        const btn = ev.currentTarget;
+        const text = ['#uScheme', '#uHost', '#uPort', '#uPath']
+          .map(s => root.querySelector(s)?.textContent || '').join('').trim();
+        const ok = await copyText(text);
+        flashCopied(btn, ok);
+        if (!ok) toast('The browser would not copy it — select the address and copy it by hand.', true);
+      });
+
+      certOpts.forEach(o => o.addEventListener('click', () => {
+        certMode = o.dataset.mode;
+        paintCert(certSnap);
+      }));
+      paintCert(certSnap);
+
+      /* The rail and the accordions are the preview's own handlers, rebound in
+         screen.js; only the starting pane is decided here. */
+      root.querySelectorAll('[data-p]').forEach(p => { p.hidden = p.dataset.p !== 'update'; });
+
+      /* "Where you are": what runs now, and the versions there are restore
+         points for. The preview listed three by hand. */
+      /* Asked once and used by both lists below. */
+      const pr = await api.restorePoints().catch(() => []);
+      const points = Array.isArray(pr) ? pr : [];
+      const runningTag = store.get().stats?.version || '';
+      const next = upd.status === 'fulfilled' && upd.value?.available
+        ? upd.value?.summary?.match(/v?\d+(?:\.\d+)+/)?.[0] : '';
+
+      /* The Release row said "Install 1.7.6" on every server, whatever it was
+         running and whatever was out — it was the preview's own sentence and
+         nothing ever rewrote it. It says what is true now: the version that is
+         available, or that there is none. */
+      {
+        const inst = byText(/^install$/i)[0];
+        const row = inst?.closest('.arow');
+        const b = row?.querySelector('.tx b');
+        const s = row?.querySelector('.tx span');
+        if (b && s) {
+          if (next) {
+            b.textContent = `Install ${next}`;
+            s.textContent = `You are on ${runningTag || 'an older version'} · a restore point is taken first · tunnels restart once`;
+            inst.hidden = false;
+          } else {
+            b.textContent = runningTag ? `${runningTag} is the latest` : 'Up to date';
+            s.textContent = upd.status === 'fulfilled' && upd.value?.error
+              ? `Could not check: ${upd.value.summary}`
+              : 'Nothing newer on this channel.';
+            inst.hidden = true;
+          }
+        }
+      }
+
+      if (upd.status === 'fulfilled') {
+        const rows = [];
+        if (next) {
+          rows.push([next, 'available',
+            'Not installed yet. A restore point is taken before it installs.']);
+        }
+        rows.push([runningTag, 'running', 'What every tunnel here is running on.']);
+        for (const p of points.slice(0, 3)) {
+          if (p.version === runningTag) continue;
+          rows.push([p.version, '', `Restore point from ${shortDate(p.created)}`]);
+        }
+        const first = root.querySelector('.ev');
+        const list = first?.parentElement;
+        if (list) {
+          list.innerHTML = rows.map(([v, tagName, note]) => `
+            <div class="ev ${tagName === 'available' ? 'next' : tagName === 'running' ? 'now' : ''}">
+              <b>${esc(v)}${tagName ? `<span class="tag3">${esc(tagName)}</span>` : ''}</b>
+              <span>${esc(note)}</span></div>`).join('');
+        }
+      }
+
+      /* Restore points: the panel can list them and nothing more. RestoreSnapshot
+         is reachable from the Telegram bot, not over HTTP, so a "Roll back"
+         button here would be a button that cannot work. */
+      {
+        const label = [...root.querySelectorAll('.gl2')]
+          .find(g => g.textContent.trim().toLowerCase() === 'restore points');
+        const box = label?.parentElement;
+        if (box) {
+          /* tunnels is null on a restore point taken while there were none —
+             which is every point on a fresh server. Reading .length off it
+             threw "Cannot read properties of null", and because it threw
+             inside this bind, everything after it was never wired and the
+             preview's sample points ("Before 1.7.5", "Before 1.7.4") stayed
+             on screen as if this machine had them. */
+          box.innerHTML = `<div class="gl2">Restore points</div>` + (points.length
+            ? points.map(x => {
+                const n = (x.tunnels || []).length;
+                return `<div class="arow"><div class="tx">
+                 <b>Before ${esc(x.version || 'an update')}</b>
+                 <span>${esc(shortDate(x.created))} · ${n} tunnel${n === 1 ? '' : 's'}${x.reason ? ` · ${esc(x.reason)}` : ''}</span>
+               </div></div>`;
+              }).join('')
+            : `<div class="arow"><div class="tx"><b>None yet</b>
+                 <span>One is taken automatically before every update.</span></div></div>`) +
+            `<div class="hint">Roll back to one from <a href="#/maintenance">Maintenance → Restore points</a>.</div>`;
+        }
+      }
+
+      /* Only the one that means every other device. The rows painted above have
+         a "Sign out" of their own and their own handler, and matching that text
+         here as well gave one device's button the meaning of all of them. */
+      byText(/sign out all other devices/i).forEach(bt => bt.addEventListener('click', async () => {
+        if (!await confirmBox({ title: 'Sign out every other device?',
+          body: 'This session stays signed in. Every other one is ended at once.',
+          go: 'Sign out' })) return;
+        try { await api.sessionRevokeOthers(); toast('Every other device was signed out.'); }
+        catch (e) { oops(e); }
+      }));
+
+      /* Rows that open another screen say so with data-to, the same way the
+         overview's do. One delegated handler, because the settings screen
+         builds nothing here — the rows are in the markup. */
+      root.addEventListener('click', ev => {
+        const b = ev.target.closest('[data-to]');
+        if (b && root.contains(b)) { close(); go(b.dataset.to); }
+      });
+
+      /* The buttons the preview drew without handlers, each on the endpoint
+         that actually does the thing. Anything the panel has no endpoint for is
+         left out rather than wired to nothing. */
+
+      byText(/^install/i).forEach(b => b.addEventListener('click', async () => {
+        if (!await confirmBox({
+          title: 'Install the update?',
+          body: 'A restore point is saved first, and it rolls itself back if the tunnels do not come back up.',
+          go: 'Install',
+        })) return;
+        b.disabled = true;
+        try { await api.updateStart(); toast('Update started — watch it in Maintenance.'); }
+        catch (e) { oops(e); }
+      }));
+
+      byText(/^changelog$/i).forEach(b => b.addEventListener('click', () =>
+        window.open('https://github.com/AminMGMT/BackPack/releases', '_blank', 'noopener')));
+
+      byText(/^download$/i).forEach(b => b.addEventListener('click', () => {
+        location.href = api.backupExportURL();
+      }));
+
+      applyCertBtn?.addEventListener('click', async () => {
+        const domain = root.querySelector('[name="domain"]')?.value.trim() || '';
+        const email = root.querySelector('[name="email"]')?.value.trim() || '';
+        const certFile = root.querySelector('[name="certFile"]')?.value.trim() || '';
+        const keyFile = root.querySelector('[name="keyFile"]')?.value.trim() || '';
+        if (certMode === 'acme' && !domain) return toast('Let’s Encrypt needs a domain pointed at this server.', true);
+        if (certMode === 'own' && (!certFile || !keyFile)) return toast('Give both files: the certificate and its key.', true);
+        if (!await confirmBox({
+          title: certMode === 'http' ? 'Serve the panel over plain HTTP?'
+               : certMode === 'self' ? 'Use a self-signed certificate?'
+               : certMode === 'own' ? 'Serve the panel with your certificate?'
+               : 'Get a certificate from Let’s Encrypt?',
+          body: 'The panel restarts and its address changes. This page follows it; '
+              + 'if it does not, open the address shown above.',
+          go: 'Apply', danger: certMode === 'http',
+        })) return;
+        try {
+          const r = await api.panelCert({ mode: certMode, domain, email, certFile, keyFile });
+          if (r.status === 'unchanged') return toast('That is already how the panel is served.');
+          toast(r.issues
+            ? 'Asking Let’s Encrypt for a certificate — the panel is restarting.'
+            : 'Applied — the panel is restarting.');
+          /* It answers before it restarts, so the new address is known here and
+             nowhere else: without this the browser sits on an address that has
+             just stopped answering. */
+          if (r.url) setTimeout(() => { location.href = r.url; }, 2500);
+        } catch (e) { oops(e); }
+      });
+
+      /* The port and the password both end this session, so both ask first. */
+      byTextIn('access', /^(save|apply)$/i).forEach(b => b.addEventListener('click', async () => {
+        const port = root.querySelector('[name="port"]')?.value;
+        const pw = root.querySelector('[name="password"]')?.value;
+        const again = root.querySelector('[name="confirm"]')?.value;
+        try {
+          if (pw) {
+            if (pw !== again) return toast('The two passwords do not match.', true);
+            if (!await confirmBox({
+              title: 'Change the panel password?',
+              body: 'Every signed-in device is signed out, including this one.',
+              go: 'Change it', danger: true,
+            })) return;
+            await api.setPassword({ password: pw });
+            toast('Password changed — signing you out.');
+            /* api.base(), not a bare '/logout'. The panel lives under one
+               unguessable path segment and answers nothing outside it, so the
+               sign-out these two lines promise landed on a 404 and left the
+               operator holding a session cookie for a password that no longer
+               exists. The header's own logout link was always right, which is
+               why this only ever showed up here. */
+            setTimeout(() => { location.href = api.base() + '/logout'; }, 1200);
+            return;
+          }
+          if (port) {
+            if (!await confirmBox({
+              title: `Move the panel to port ${esc(port)}?`,
+              body: 'You will be redirected to the new address.',
+              go: 'Move',
+            })) return;
+            await api.setPanelPort(port);
+            toast('Moving — the panel restarts on the new port.');
+          }
+        } catch (e) { oops(e); }
+      }));
+
+      /* Its own button, because it sits in its own group with its own two
+         fields: the generic Save is the panel-access one, and matching on
+         "save" alone left this one bound to nothing at all. */
+      byText(/^save password$/i).forEach(b => b.addEventListener('click', async () => {
+        const pw = root.querySelector('[name="password"]')?.value || '';
+        const again = root.querySelector('[name="confirm"]')?.value || '';
+        if (!pw) return toast('Type the new password first.', true);
+        if (pw !== again) return toast('The two passwords do not match.', true);
+        if (!await confirmBox({
+          title: 'Change the panel password?',
+          body: 'Every signed-in device is signed out, including this one.',
+          go: 'Change it', danger: true,
+        })) return;
+        try {
+          await api.setPassword({ password: pw });
+          toast('Password changed — signing you out.');
+          setTimeout(() => { location.href = api.base() + '/logout'; }, 1200);
+        } catch (e) { oops(e); }
+      }));
+
+      /* Restoring needs a file, and the screen was drawn without an input to
+         pick one — so the button opens one made here. */
+      byText(/^restore/i).forEach(b => b.addEventListener('click', () => {
+        const pick = el('input', { type: 'file', accept: '.tar.gz,.tgz,application/gzip' });
+        pick.style.display = 'none';
+        root.append(pick);
+        pick.addEventListener('change', async () => {
+          const file = pick.files && pick.files[0];
+          if (!file) return;
+          if (!await confirmBox({
+            title: 'Restore from this backup?',
+            body: 'It replaces the tunnels, the panel password and the bot settings on this '
+                + 'server with the ones in the file, and restarts the tunnels.',
+            lines: [{ text: file.name }],
+            go: 'Restore', danger: true,
+          })) return;
+          try { await api.backupImport(file); toast('Restored — the tunnels are coming back up.'); }
+          catch (e) { oops(e); }
+          pick.remove();
+        });
+        pick.click();
+      }));
+
+      byText(/^send test$/i).forEach(bt => bt.addEventListener('click', async () => {
+        bt.disabled = true;
+        try { await api.telegramTest(); toast('Test report sent.'); } catch (e) { oops(e); }
+        bt.disabled = false;
+      }));
+
+      /* The bot's own settings save separately from the panel's. */
+      byTextIn('telegram', /^(save|save bot|connect|update bot)$/i).forEach(bt => bt.addEventListener('click', async () => {
+        const get = n => root.querySelector(`[name="${n}"]`)?.value?.trim() || '';
+        try {
+          /* Flat, and under the handler's own names. A nested `alerts` object
+             was stringified into one "[object Object]" field, so the three
+             thresholds on this screen were posted and read by nothing. */
+          await api.telegramSave({
+            token: get('token'), adminId: get('adminId'),
+            intervalHours: Number(get('intervalHours')) || 6,
+            alertCPU: Number(get('alerts.cpu')) || 0,
+            alertMem: Number(get('alerts.mem')) || 0,
+            alertDisk: Number(get('alerts.disk')) || 0,
+          });
+          toast('Bot settings saved.');
+        } catch (e) { oops(e); }
+      }));
+
+      /* The switches and the menus were drawings.
+       *
+       * Nine of them: two-factor, the sign-in notice, the three Telegram
+       * notices, the bot language, the relay, the update channel and the weekly
+       * backup. Every one rendered, none did anything — api.setChannel and
+       * api.setAutoBackup were never called from anywhere, and telegramSave
+       * posted JSON at a handler that reads form values, so it reported
+       * success and changed nothing.
+       *
+       * Each control now carries the handler's own form key as data-name, and
+       * saves the moment it is used: a settings screen with no Save button
+       * should not have settings that need one.
+       */
+      const ctlOf = n => root.querySelector(`[data-name="${n}"]`);
+      const isOn = n => !!ctlOf(n)?.classList.contains('on');
+      const valOf = n => ctlOf(n)?.dataset.value ?? '';
+
+      /* The bot's own settings travel together — the handler reads the whole
+         form and keeps what is missing, so sending one key alone is fine, but
+         sending them together is what the Save button already does. */
+      const saveTelegram = async () => {
+        try {
+          await api.telegramSave({
+            alertsEnabled: isOn('alertsEnabled'),
+            alertTunnelDown: isOn('alertTunnelDown'),
+            alertNewRelease: isOn('alertNewRelease'),
+            relayMode: valOf('relayMode'), lang: valOf('lang'),
+          });
+          toast('Bot settings saved.');
+        } catch (e) { oops(e); }
+      };
+
+      const onFlip = {
+        alertsEnabled: saveTelegram, alertTunnelDown: saveTelegram,
+        alertNewRelease: saveTelegram,
+        autoBackup: async on => {
+          try { await api.setAutoBackup(on); toast(on ? 'Weekly backups on.' : 'Weekly backups off.'); }
+          catch (e) { oops(e); }
+        },
+      };
+
+      const kind = n => (n.className || '').split(' ')[0];
+      root.querySelectorAll('[data-name]').forEach(sw => {
+        if (sw.dataset.wired || !/^sw/.test(kind(sw))) return;
+        sw.dataset.wired = '1';
+        sw.setAttribute('role', 'switch');
+        sw.tabIndex = 0;
+        const flip = async () => {
+          sw.classList.toggle('on');
+          const on = sw.classList.contains('on');
+          sw.setAttribute('aria-checked', String(on));
+          const fn = onFlip[sw.dataset.name];
+          if (fn) await fn(on);
+        };
+        sw.addEventListener('click', flip);
+        sw.addEventListener('keydown', ev => {
+          if (ev.key === ' ' || ev.key === 'Enter') { ev.preventDefault(); flip(); }
+        });
+      });
+
+      const menuChoices = {
+        channelBeta: [{ value: '0', label: 'Stable — finished releases only (recommended)' },
+                      { value: '1', label: 'Beta — pre-releases as they land' }],
+        relayMode: [{ value: 'auto', label: 'Automatic — through a tunnel when one is up' },
+                    { value: 'direct', label: 'Direct — never through a tunnel' }],
+        lang: [{ value: 'en', label: 'English' }, { value: 'fa', label: 'فارسی' }],
+        /* The token's scope. It had no entry here, so the menu never opened
+           and every token the panel issued was read-only — the backend has
+           always taken all three. */
+        tokScope: [{ value: 'read', label: 'Read only' },
+                   { value: 'write', label: 'Read and change' },
+                   { value: 'admin', label: 'Everything, including access' }],
+      };
+      /* Menus that only pick a value for a form on this screen. Every other
+         menu here saves the Telegram settings on a pick. */
+      const localOnly = new Set(['tokScope']);
+
+      /* Naming one tunnel is the third answer this setting has, and the one the
+         panel never offered: the handler takes a tunnel name and opens a SOCKS
+         port on it, and /api/relays exists to say which tunnels can do that.
+         Without this the menu had two of its three options. */
+      try {
+        for (const t of (await api.relays()) || []) {
+          if (!t || !t.name) continue;
+          menuChoices.relayMode.push({
+            value: t.name,
+            label: `${t.name} — through this tunnel${isUp(t) ? '' : ' (not up right now)'}`,
+          });
+        }
+      } catch (e) { /* the two fixed answers are still there */ }
+
+      root.querySelectorAll('[data-name]').forEach(sel => {
+        if (!/^sel/.test(kind(sel))) return;
+        const name = sel.dataset.name;
+        const list = menuChoices[name];
+        if (!list || sel.dataset.wired) return;
+        sel.dataset.wired = '1';
+        sel.setAttribute('role', 'combobox');
+        sel.tabIndex = 0;
+        const menu = el('div', { class: 'selmenu', hidden: true });
+        list.forEach(c => {
+          const b = el('button', { type: 'button', class: 'selopt', text: c.label });
+          b.addEventListener('click', async ev => {
+            ev.stopPropagation();
+            sel.dataset.value = c.value;
+            sel.childNodes[0].textContent = c.label;
+            menu.hidden = true;
+            sel.classList.remove('open');
+            if (localOnly.has(name)) return;
+            try {
+              if (name === 'channelBeta') {
+                await api.setChannel(c.value === '1');
+                toast(c.value === '1' ? 'Beta channel.' : 'Stable channel.');
+              } else {
+                await saveTelegram();
+              }
+            } catch (e) { oops(e); }
+          });
+          menu.append(b);
+        });
+        sel.append(menu);
+        sel.addEventListener('click', ev => {
+          if (ev.target.closest('.selopt')) return;
+          const open = menu.hidden;
+          root.querySelectorAll('.selmenu').forEach(m => { m.hidden = true; });
+          menu.hidden = !open;
+          sel.classList.toggle('open', open);
+        });
+      });
+      root.addEventListener('click', ev => {
+        if (ev.target.closest('.sel')) return;
+        root.querySelectorAll('.selmenu').forEach(m => { m.hidden = true; });
+        root.querySelectorAll('.sel.open').forEach(x => x.classList.remove('open'));
+      });
+
+      /* What the server already has, reflected onto the faces. */
+      const setSw = (n, on) => {
+        const c = ctlOf(n);
+        if (c) { c.classList.toggle('on', !!on); c.setAttribute('aria-checked', String(!!on)); }
+      };
+      setSw('alertsEnabled', tgNow.alerts?.enabled);
+      setSw('alertTunnelDown', tgNow.alerts?.tunnelDown);
+      setSw('alertNewRelease', tgNow.alerts?.newRelease);
+      setSw('autoBackup', abNow.enabled);
+      /* The line above the backup pane claimed a backup was taken "yesterday at
+         03:00 · 2.4 MB". Nothing reports that — /api/autobackup answers whether
+         the weekly backup is on and nothing else — so it was a date and a size
+         invented by the preview and shown as fact. It now says the one thing
+         that is actually known. */
+      /* The bot's status line named a bot — "Connected as @my_backpack_bot" —
+         that belongs to whoever drew the screen. What is known is whether a
+         token and an admin are set, and the masked hint for the token. */
+      const tgState = root.querySelector('[data-p="telegram"] .state2');
+      if (tgState) {
+        tgState.classList.toggle('ok', !!tgNow.configured);
+        tgState.textContent = tgNow.configured
+          ? 'Connected' + (tgNow.tokenHint ? ' — token ' + tgNow.tokenHint : '')
+          : 'Not configured — add a bot token and an admin id below.';
+      }
+
+      const bkState = root.querySelector('[data-p="backup"] .state2');
+      if (bkState) {
+        bkState.classList.toggle('ok', !!abNow.enabled);
+        bkState.textContent = abNow.enabled
+          ? 'The weekly backup is on — one is taken automatically and kept on this server.'
+          : 'The weekly backup is off. Download one below, or turn it on.';
+      }
+      const setSel = (n, v, label) => {
+        const c = ctlOf(n);
+        if (!c || v === undefined) return;
+        c.dataset.value = String(v);
+        if (label) c.childNodes[0].textContent = label;
+      };
+      const onBeta = (chNow.channel || 'stable') === 'beta';
+      setSel('channelBeta', onBeta ? '1' : '0',
+        onBeta ? 'Beta — pre-releases as they land' : 'Stable — finished releases only (recommended)');
+      setSel('relayMode', tgNow.relayMode);
+      setSel('lang', tgNow.lang);
+
+      /* The search box.
+       *
+       * It was drawn with a placeholder promising to find every setting, a hit
+       * counter beside each section and an esc hint on the field — and nothing
+       * bound to it, so typing in it did nothing at all. A control that
+       * advertises a behaviour that badly has to have it.
+       *
+       * Rows are matched on what they say rather than on a keyword list: the
+       * label and the hint under it are the words the operator would search
+       * for, and a list kept beside them is a list that goes stale.
+       */
+      const q = root.querySelector('#setq');
+      if (q) {
+        const rows = [...root.querySelectorAll('.f2b, .tg2, .arow, .line3')];
+        const total = rows.length;
+        const cnt = root.querySelector('#setcnt');
+        const groups = [...root.querySelectorAll('.grp2')];
+
+        const apply = () => {
+          const term = q.value.trim().toLowerCase();
+          let shown = 0;
+          rows.forEach(r => {
+            const hit = !term || (r.innerText || '').toLowerCase().includes(term);
+            r.hidden = !hit;
+            if (hit) shown++;
+          });
+          // A heading over nothing is worse than no heading.
+          groups.forEach(g => {
+            g.hidden = !!term && ![...g.querySelectorAll('.f2b, .tg2, .arow, .line3')]
+              .some(r => !r.hidden);
+          });
+          // Each section says how many of its own settings matched, which is
+          // what the counter beside it was drawn for.
+          root.querySelectorAll('.rail3 [data-k]').forEach(a => {
+            const pane = root.querySelector(`[data-p="${a.dataset.k}"]`);
+            const n = pane
+              ? [...pane.querySelectorAll('.f2b, .tg2, .arow, .line3')].filter(r => !r.hidden).length
+              : 0;
+            const hits = a.querySelector('.hits');
+            if (hits) hits.textContent = term && n ? String(n) : '';
+            a.classList.toggle('nohit', !!term && !n);
+          });
+          if (cnt) {
+            cnt.textContent = term
+              ? `${shown} of ${total} settings`
+              : `${total} settings`;
+          }
+        };
+
+        q.addEventListener('input', apply);
+        q.addEventListener('keydown', ev => {
+          if (ev.key === 'Escape') { ev.stopPropagation(); q.value = ''; apply(); }
+        });
+        apply();
+      }
+
+      ctx.setTeardown(close);
+    },
+  }).catch(oops);
+}

@@ -1,0 +1,226 @@
+package node
+
+import (
+	"encoding/json"
+	"errors"
+)
+
+// The operations a node will perform. This list is the security boundary: a
+// node executes these and refuses everything else, so widening it is the one
+// change in this package that has to be argued for rather than made.
+//
+// Note what is absent. There is no operation that runs a command, reads a path,
+// installs a binary, or removes a tunnel. The first three would turn the
+// channel into a remote shell. The fourth is left out for a different reason —
+// applying a configuration is reversible, because the previous one is filed and
+// a failed apply rolls back, and deleting is not. A tunnel that should not
+// exist can be stopped from here and removed on the machine.
+const (
+	// OpHello asks a node to describe itself. The panel calls it on every
+	// reconnect, because an address, a kernel or a version can change between
+	// one connection and the next and a stale fact on a fleet screen is worse
+	// than no fact.
+	OpHello = "hello"
+
+	// OpApply sends the complete desired state of one tunnel. It creates the
+	// tunnel if it is not there and rewrites it if it is; see ApplyRequest.
+	OpApply = "apply"
+
+	// OpList asks which tunnels the node has, and whether they are running.
+	OpList = "list"
+
+	// OpStatus asks about one tunnel by name.
+	OpStatus = "status"
+
+	// OpSettings reads back one tunnel's settings as the panel's own edit form
+	// would show them.
+	//
+	// It exists because an edit rebuilds the far end from the mirror of this
+	// end, and the mirror carries only what the two ends must agree on. The
+	// answers that belong to the far end alone — its outbound proxy, the
+	// interface or source address it dials from, its backup addresses — were
+	// given once, when the tunnel was paired, and are held nowhere on this
+	// side. Rebuilding without them would quietly drop them on every edit, so
+	// the panel asks the node what it currently has and lays the edit over it.
+	OpSettings = "settings"
+
+	// OpLogs returns the far end's journal for one tunnel.
+	//
+	// A tunnel is one thing in two places and its log is not: half of what went
+	// wrong is on the other machine, and reading it meant logging into that
+	// machine — which is the second pass the whole fleet feature exists to
+	// remove. The panel asks for it the same way it asks for anything else.
+	OpLogs = "logs"
+
+	// OpLinkTest measures the path one of this server's tunnels dials out over.
+	//
+	// It exists because the measurement can only be taken where the dialling
+	// happens, and that is usually not the machine the panel runs on. An Iran
+	// panel manages the fleet and holds the listening half of every reverse
+	// tunnel; the half with a peer address to measure is on a server in that
+	// fleet. Without this the panel could only say "not from here", which is
+	// true and useless when it has a shell on the machine where it can be done.
+	OpLinkTest = "linktest"
+
+	// OpDelete removes one tunnel from this server: its service, its unit and
+	// its configuration, exactly as the CLI's delete does.
+	//
+	// It did not exist, deliberately: deleting a tunnel on the panel's own
+	// machine is not consent to deleting one somewhere else, and a delete has
+	// no undo. What changed is not that reasoning but who acts on it — the
+	// panel now asks about the far end as its own question, separately from
+	// the one it asks about this end, and only sends this when the answer was
+	// yes. An operator who says nothing still gets what they got before: this
+	// end gone, the other end named and left alone.
+	OpDelete = "delete"
+
+	// OpStart, OpStop and OpRestart drive one tunnel's service. Nothing is
+	// written by any of them.
+	//
+	// A tunnel is one tunnel in two places, and its state is one state: an end
+	// stopped on its own is not a stopped tunnel, it is a tunnel with one half
+	// dialling something that will never answer, retrying for as long as anyone
+	// leaves it. So the card's buttons reach both ends, the same way its Edit
+	// does.
+	OpStart   = "start"
+	OpStop    = "stop"
+	OpRestart = "restart"
+)
+
+// Request is one operation. Body is the operation's own arguments, left as raw
+// JSON so that a panel and a node running different versions can pass a field
+// neither of them shares an opinion about.
+type Request struct {
+	Op   string          `json:"op"`
+	Body json.RawMessage `json:"body,omitempty"`
+}
+
+// Response is the answer. Err carries a message meant to be shown to the
+// operator as-is: it is the node's own words about the node's own machine, and
+// rewording it at the panel loses the only description of what actually
+// happened.
+type Response struct {
+	OK   bool            `json:"ok"`
+	Err  string          `json:"err,omitempty"`
+	Body json.RawMessage `json:"body,omitempty"`
+}
+
+// Info is what a node reports about itself.
+type Info struct {
+	Name     string `json:"name,omitempty"` // the node's name in the panel
+	Hostname string `json:"hostname,omitempty"`
+	Version  string `json:"version,omitempty"`
+	OS       string `json:"os,omitempty"`
+	Arch     string `json:"arch,omitempty"`
+	IPv4     string `json:"ipv4,omitempty"`
+	IPv6     string `json:"ipv6,omitempty"`
+
+	// What the fleet card says about the machine itself.
+	//
+	// OS above is the kernel's word for the platform — "linux" — which says
+	// nothing an operator did not already know. Distro is what the machine
+	// calls itself, and Uptime is how long it has been up, which together are
+	// the two facts worth looking at a server's card to read when nothing is
+	// wrong.
+	Distro string `json:"distro,omitempty"`
+	Uptime string `json:"uptime,omitempty"`
+
+	// What the machine is doing right now.
+	//
+	// The card showed what a server is and not what it is doing, so a node
+	// under load looked exactly like an idle one. These are read on the far
+	// machine when the panel asks, which is the only place they can be read at
+	// all — this panel cannot see another server's processor.
+	CPUPercent float64 `json:"cpuPercent,omitempty"`
+	CPUCores   int     `json:"cpuCores,omitempty"`
+	MemPercent float64 `json:"memPercent,omitempty"`
+	MemUsed    uint64  `json:"memUsed,omitempty"`
+	MemTotal   uint64  `json:"memTotal,omitempty"`
+
+	// Where the machine is, as the machine itself sees it.
+	//
+	// The panel used to work this out by looking up the peer's address, and on
+	// an Iran server that lookup goes to providers the route does not reach —
+	// so it returned nothing, and every card showed a dot where a flag belongs
+	// and a dash where a location belongs. A managed server is outside that
+	// route by definition, so it can answer for itself, and the panel is told
+	// rather than guessing.
+	Country string `json:"country,omitempty"` // ISO code, for the flag
+	City    string `json:"city,omitempty"`
+	ISP     string `json:"isp,omitempty"`
+}
+
+// LogsRequest asks for one tunnel's journal on the far server.
+type LogsRequest struct {
+	Name  string `json:"name"`
+	Lines int    `json:"lines,omitempty"` // 0 means the usual number
+}
+
+// LogsResult is what came back.
+type LogsResult struct {
+	Name string `json:"name"`
+	Text string `json:"text"`
+}
+
+// TunnelState is one tunnel on a node, as the fleet screen shows it.
+type TunnelState struct {
+	Name    string `json:"name"`
+	Kind    string `json:"kind,omitempty"` // reverse, direct or l3
+	Service string `json:"service,omitempty"`
+	Active  bool   `json:"active"`
+	Enabled bool   `json:"enabled"`
+
+	// Role, TunnelPort and ServerHost are what identify this tunnel as one
+	// half of a pair.
+	//
+	// A tunnel has two ends and nothing in either configuration names the
+	// other by name — the operator is free to call them anything. What does
+	// tie them together is the address they meet at: a reverse client dials
+	// its server's host and port, and that port is exactly the one the server
+	// binds. So a client over there whose ServerHost is this machine and whose
+	// TunnelPort is this tunnel's port is this tunnel's other end, and no
+	// amount of renaming changes that.
+	//
+	// They are carried on the list rather than fetched per tunnel because the
+	// alternative is one SSH round trip per candidate to answer a question
+	// about all of them.
+	Role       string `json:"role,omitempty"`       // server | client
+	TunnelPort string `json:"tunnelPort,omitempty"` // the port the pair meets on
+	ServerHost string `json:"serverHost,omitempty"` // client-side only: who it dials
+
+	// ServiceDown is set when this server's end of the tunnel is delivering
+	// connections into nothing — the service it forwards to is not listening.
+	//
+	// It crosses the wire because only this end can see it. The panel runs on
+	// the other machine, where the tunnel looks perfectly healthy and is: the
+	// control channel is up, the peer is there, the traffic counters move.
+	// Without this the operator's only route to the fact was to open the far
+	// server's journal and read it.
+	ServiceDown string `json:"serviceDown,omitempty"`
+
+	// Connected is the engine's own answer about its control channel, as
+	// distinct from Active, which is only systemd's answer about the process.
+	//
+	// The difference is the whole failure this product cares about: a unit that
+	// is running and a tunnel that is carrying are not the same claim, and a
+	// staged rollout that asks only the first will pass a canary whose binary
+	// came back and whose tunnel did not. A pointer because absent has to be
+	// distinguishable from false — a node still running an older build through
+	// an upgrade has no opinion here, and reading that as "not connected" would
+	// halt a rollout on every node until they had all been upgraded, which is
+	// the one thing a rollout cannot do.
+	Connected *bool `json:"connected,omitempty"`
+}
+
+// ApplyResult says what an apply did.
+type ApplyResult struct {
+	Service string `json:"service"`
+	Active  bool   `json:"active"`
+	// Created distinguishes the tunnel that was made from the one that was
+	// rewritten, which is the difference between "added" and "updated" in the
+	// panel's own wording.
+	Created bool `json:"created"`
+}
+
+// errUnknownOp is what a node answers to anything not on the list.
+var errUnknownOp = errors.New("this panel asked for something this server does not do")
